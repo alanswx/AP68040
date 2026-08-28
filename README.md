@@ -118,7 +118,7 @@ comments record which oracle settled each one and where.
 
 ## License
 
-GPL v3 or later — see [LICENSE](LICENSE). The core was written as part of
+GPL v2 or later — see [LICENSE](LICENSE). The core was written as part of
 Minimig-AGA_MiSTer, which is distributed under the same terms.
 
-Copyright © 2025-2026 Adam Polkosnik
+Copyright © 2026 Adam Polkosnik
