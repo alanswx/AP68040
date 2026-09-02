@@ -58,6 +58,13 @@ module ap040_cache
 	output      [2:0] m_fc,
 	input             m_ack,
 	input      [31:0] m_rdata,
+	// Optional completed-line sideband.  A host that already retained the
+	// whole 16-byte physical line may let a fill copy its remaining words
+	// locally instead of issuing redundant bus transactions.  The CPU is
+	// still acknowledged only after all four words and the tag are committed.
+	input             m_line_valid,
+	input      [31:4] m_line_tag,
+	input     [127:0] m_line_data,
 	// A physical bus error on the transfer this cache issued.  The core
 	// samples the same signal and builds its format-$7 frame; the cache
 	// must abandon the transfer rather than re-issue it forever.
@@ -299,7 +306,20 @@ reg        pass_ci_chk;   // first C_PASS cycle of a CI read: tags valid
 reg        ci_inv_pend;   // a CI hit awaits its row invalidate
 reg  [6:0] ci_inv_row;
 
-assign m_req   = fill_active ? 1'b1 : (pass_active ? c_req : 1'b0);
+// A line can become valid while the first beat is already in flight.  Never
+// abandon an issued transfer; after it completes, copy later beats directly
+// from the retained line one word per cache clock.  Exact physical-tag
+// matching makes the sideband harmless for hosts that retain some other line.
+wire fill_line_match = fill_active && !r_issued && m_line_valid &&
+                       (m_line_tag == r_addr[31:4]);
+wire [31:0] fill_line_word = (r_beat == 2'd0) ? m_line_data[127:96] :
+                             (r_beat == 2'd1) ? m_line_data[95:64]  :
+                             (r_beat == 2'd2) ? m_line_data[63:32]  :
+                                                        m_line_data[31:0];
+wire fill_line_write = fill_line_match;
+
+assign m_req   = fill_active ? !fill_line_match :
+                 (pass_active ? c_req : 1'b0);
 assign m_write = fill_active ? 1'b0 : c_write;
 assign m_instr = c_instr;
 assign m_size  = fill_active ? `AP040_SZ_L : c_size;
@@ -369,10 +389,10 @@ assign inv_idx  = snoop_wr        ? {1'b0, s_addr[9:4]} :
                   (cst == C_IDLE) ? {1'b0, c_addr[9:4]} : {1'b0, winv_set2};
 assign cd_rd_en  = rd_accept;                       // issued with the tag read
 assign cd_ridx   = {c_instr, a_set, c_addr[3:2]};
-assign cd_we     = ((cst == C_FILL) && r_issued && m_ack)
+assign cd_we     = (((cst == C_FILL) && r_issued && m_ack) || fill_line_write)
                    ? (4'd1 << r_way) : 4'd0;
 assign cd_widx   = {r_bank, r_row[5:0], r_beat};
-assign cd_wdat   = m_rdata;
+assign cd_wdat   = fill_line_write ? fill_line_word : m_rdata;
 
 // the four ways arrive together; the tag compare picks one
 wire [31:0] data_hit = (hit_way == 2'd0) ? data_q0 :
@@ -582,6 +602,14 @@ always @(posedge clk) begin
 					r_issued <= 0;
 					err_hold <= 1;
 					cst <= C_FERR;
+				end
+				else if (fill_line_match) begin
+					// The data RAM write runs in parallel (cd_we), just as it
+					// does for a returned bus beat.  Completion remains late:
+					// C_TAGW validates the line and acknowledges the request.
+					if (r_beat == r_addr[3:2]) fill_hold <= fill_line_word;
+					if (r_beat == 2'd3) cst <= C_TAGW;
+					else r_beat <= r_beat + 2'd1;
 				end
 				else if (!r_issued) r_issued <= 1;
 				else if (m_ack) begin

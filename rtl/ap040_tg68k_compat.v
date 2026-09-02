@@ -375,6 +375,9 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.m_fc(b_fc),
 		.m_ack(b_ack),
 		.m_rdata(b_rdata),
+		.m_line_valid(1'b0),
+		.m_line_tag(28'd0),
+		.m_line_data(128'd0),
 		.m_err(berr)
 	);
 end

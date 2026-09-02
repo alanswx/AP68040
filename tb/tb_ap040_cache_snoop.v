@@ -24,6 +24,9 @@
 //             must not validate the partly-filled line, and must leave
 //             the cache able to serve the exception handler's own
 //             accesses.  The error is swept across all four beats.
+//   T10       a completed-line sideband arriving with the first memory beat
+//             must populate the fill tail locally, preserve late CPU ack,
+//             and leave the completed line hitting without more bus traffic.
 //
 // Every test reprograms memory behind the cache and requires the next
 // read to return the NEW value: a stale cached longword is the failure
@@ -59,6 +62,9 @@ reg  [1:0]  mem_lat = 2'd2;   // cycles before m_ack; 0 models a
 reg         m_ack = 0;
 reg  [31:0] m_rdata = 0;
 reg         m_err = 0;
+reg         m_line_valid = 0;
+reg  [31:4] m_line_tag = 0;
+reg [127:0] m_line_data = 0;
 
 reg         s_stb = 0;
 reg  [31:0] s_addr = 0;
@@ -85,7 +91,9 @@ ap040_cache dut
 	.c_ack(c_ack), .c_rdata(c_rdata),
 	.m_req(m_req), .m_write(m_write), .m_instr(m_instr),
 	.m_size(m_size), .m_addr(m_addr), .m_wdata(m_wdata),
-	.m_fc(), .m_ack(m_ack), .m_rdata(m_rdata), .m_err(m_err),
+	.m_fc(), .m_ack(m_ack), .m_rdata(m_rdata),
+	.m_line_valid(m_line_valid), .m_line_tag(m_line_tag),
+	.m_line_data(m_line_data), .m_err(m_err),
 	.s_stb(s_stb | s_stb_storm), .s_addr(s_stb_storm ? 32'h0000_C300 : s_addr)
 );
 
@@ -97,6 +105,7 @@ integer errors = 0;
 //---------------------------------------------------------------------------
 reg [31:0] mem [0:16383];   // 64KB
 reg  [1:0] mlat = 0;
+integer mread_count = 0;
 
 // Fault injection: while err_arm is set, an access whose address matches
 // err_addr (line-aligned, beat selected by err_beat) reports a bus error
@@ -132,6 +141,10 @@ always @(posedge clk) begin
 		end
 	end
 	else mlat <= 0;
+end
+
+always @(posedge clk) begin
+	if (m_ack && m_req && !m_write) mread_count = mread_count + 1;
 end
 
 //---------------------------------------------------------------------------
@@ -333,6 +346,8 @@ endtask
 
 integer i, off;
 integer guard5;
+integer line_base;
+integer line_guard;
 reg [31:0] d;
 reg [31:0] d2;
 
@@ -623,6 +638,76 @@ initial begin
 	snoop_storm = 0;
 	mem_lat = 2'd2;
 	repeat (6) @(posedge clk);
+
+	//------------------------------------------------------------------
+	// T10: the first ordinary beat starts a cache miss.  Model a host that
+	// captured the surrounding line alongside that response, then require
+	// the remaining three words to be copied locally.  The CPU must still
+	// wait for a complete cache line and tag; only redundant bus beats go.
+	//------------------------------------------------------------------
+	cinv_req = 1; cinv_ic = 1; cinv_dc = 1;
+	@(negedge clk);
+	while (!cinv_done) @(posedge clk);
+	cinv_req = 0;
+	repeat (4) @(posedge clk);
+
+	line_base = mread_count;
+	@(negedge clk);
+	c_req = 1; c_write = 0; c_size = 2'b10;
+	c_addr = 32'h0000_E008; c_nocache = 0;
+
+	// Let exactly one bus read complete, then expose its full retained line.
+	line_guard = 0;
+	while (!(m_ack && m_req) && line_guard < 200) begin
+		@(posedge clk);
+		line_guard = line_guard + 1;
+	end
+	if (line_guard >= 200) begin
+		$display("FAIL test 10: first bus beat timed out");
+		errors = errors + 1;
+	end
+	@(negedge clk);
+	m_line_tag = 28'h0000E00;
+	m_line_data = {mem[32'hE000>>2], mem[32'hE004>>2],
+	               mem[32'hE008>>2], mem[32'hE00C>>2]};
+	m_line_valid = 1;
+	if (c_ack) begin
+		$display("FAIL test 10: CPU acknowledged before the line was complete");
+		errors = errors + 1;
+	end
+
+	line_guard = 0;
+	while (!(c_ack && ce) && line_guard < 200) begin
+		@(posedge clk);
+		line_guard = line_guard + 1;
+	end
+	if (line_guard >= 200) begin
+		$display("FAIL test 10: sideband-assisted fill timed out");
+		errors = errors + 1;
+	end
+	if (c_rdata !== mem[32'hE008>>2]) begin
+		$display("FAIL test 10: sideband data %h expected %h",
+		         c_rdata, mem[32'hE008>>2]);
+		errors = errors + 1;
+	end
+	if ((mread_count - line_base) != 1) begin
+		$display("FAIL test 10: assisted fill issued %0d bus reads, expected 1",
+		         mread_count - line_base);
+		errors = errors + 1;
+	end
+	@(negedge clk);
+	c_req = 0;
+	m_line_valid = 0;
+
+	line_base = mread_count;
+	expect_read(32'h0000_E000, mem[32'hE000>>2], 10);
+	expect_read(32'h0000_E004, mem[32'hE004>>2], 10);
+	expect_read(32'h0000_E00C, mem[32'hE00C>>2], 10);
+	if (mread_count != line_base) begin
+		$display("FAIL test 10: completed-line hits issued %0d extra reads",
+		         mread_count - line_base);
+		errors = errors + 1;
+	end
 
 	if (errors == 0) $display("ALL TESTS PASSED");
 	else $display("TEST FAILED with %0d errors", errors);
