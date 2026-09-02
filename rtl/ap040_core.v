@@ -520,6 +520,15 @@ localparam S_FSAVE_B   = 8'd186;
 localparam S_FSAVE_BD  = 8'd187;
 localparam S_FREST_B   = 8'd188;
 localparam S_FREST_BD  = 8'd189;
+// Exception format is encoded in the registered entry state.  Loading
+// exc_fmt from these shallow state decodes removes the old direct path from
+// the instruction decoder into the exception-frame format register.
+localparam S_EXC0_F2       = 8'd191;
+localparam S_EXC0_F3       = 8'd192;
+localparam S_EXC0_F4       = 8'd193;
+localparam S_POST_EXC_F2   = 8'd194;
+localparam S_POST_EXC_F3   = 8'd195;
+localparam S_POST_EXC_F4   = 8'd196;
 
 // exec kinds
 localparam EK_ALU     = 4'd0;
@@ -1491,7 +1500,7 @@ task exc;
 	input [31:0] spc;
 	input [31:0] addr;
 	begin
-		exc_vec <= vec; exc_fmt <= fmt; exc_spc <= spc; exc_addr <= addr;
+		exc_vec <= vec; exc_spc <= spc; exc_addr <= addr;
 		exc_is_irq <= 0; exc_pass2 <= 0;
 		// A T0 trace does NOT survive an exception on the 68040.  This
 		// used to arm one for illegal/privilege/A-line/F-line, reading
@@ -1526,7 +1535,41 @@ task exc;
 		// on the fault, and a stale lk_cyc would throttle the handler's
 		// fetch queue (fetch_next is not on the exception entry path).
 		lk_cyc <= 0;
-		state <= S_EXC0;
+		// Carry the format in the entry state instead of driving exc_fmt
+		// directly from the full instruction decoder.  The entry state loads
+		// the architectural frame field on the following qualified edge.
+		case (fmt)
+			4'd2: state <= S_EXC0_F2;
+			4'd3: state <= S_EXC0_F3;
+			4'd4: state <= S_EXC0_F4;
+			default: state <= S_EXC0;
+		endcase
+	end
+endtask
+
+// Common exception-entry work.  Each caller supplies a constant selected by
+// a registered state, keeping the exc_fmt input cone short while retaining
+// the original exception latency.
+task exc0_enter;
+	input [3:0] fmt;
+	begin
+		if (!fpu_bg && !epf_pend) begin
+			exc_fmt <= fmt;
+			// Kill any address-register rollback records on the way into a
+			// non-access exception.  They belong only to the faulting access.
+			u0_v <= 0;
+			u1_v <= 0;
+			sr_saved <= sr;
+			sr[13] <= 1;
+			sr[15:14] <= 2'b00;
+			in_exc <= 1;
+			if (exc_is_irq) begin
+				sr[10:8] <= irq_lvl_l;
+				if (irq_lvl_l == 3'd7) nmi_ack_t <= ~nmi_ack_t;
+				else irq_ack_t <= ~irq_ack_t;
+			end
+			state <= S_EXC1;
+		end
 	end
 endtask
 
@@ -1652,7 +1695,7 @@ task fetch_next;
 				tr_t1 <= 0;
 			end
 			exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-			exc_fmt <= 0; exc_spc <= pc; exc_addr <= 0;
+			exc_spc <= pc; exc_addr <= 0;
 			exc_is_irq <= 1; exc_pass2 <= 0;
 			irq_lvl_l <= irq_take_lvl;
 			// As with trace, an interrupt recognized at the instruction
@@ -1665,7 +1708,7 @@ task fetch_next;
 			exc(`AP040_VEC_TRACE, 4'd2, pc, pc_i);
 			// Instruction writeback is registered separately.  Do not let
 			// S_EXC0 sample Dn/An/A7 on the same edge that commits it.
-			state <= S_POST_EXC;
+			state <= S_POST_EXC_F2;
 		end
 		else begin
 			issue_ifetch(pc, sr_s);
@@ -1723,7 +1766,7 @@ task go_pc;
 				texc_pend <= 1;
 				texc_pc <= pc_i;
 				exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-				exc_fmt <= 0; exc_spc <= t; exc_addr <= 0;
+				exc_spc <= t; exc_addr <= 0;
 				exc_is_irq <= 1; exc_pass2 <= 0;
 				irq_lvl_l <= irq_take_lvl;
 				epf_flush;
@@ -1749,7 +1792,7 @@ task go_pc;
 			fc_ovr_v <= 0;
 			if (irq_pend) begin
 				exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-				exc_fmt <= 0; exc_spc <= t; exc_addr <= 0;
+				exc_spc <= t; exc_addr <= 0;
 				exc_is_irq <= 1; exc_pass2 <= 0;
 				irq_lvl_l <= irq_take_lvl;
 				// BSR/JSR and taken DBcc can commit A7/Dn on the
@@ -2023,7 +2066,7 @@ always @(posedge clk) begin
 				// Discard the fetched word and stack a return to the handler entry.
 				if (in_exc && irq_pend) begin
 					exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-					exc_fmt <= 0; exc_spc <= pc; exc_addr <= 0;
+					exc_spc <= pc; exc_addr <= 0;
 					exc_is_irq <= 1; exc_pass2 <= 0;
 					irq_lvl_l <= irq_take_lvl;
 					epf_flush;
@@ -2151,7 +2194,10 @@ always @(posedge clk) begin
 			// Post-instruction trace/IRQ commit barrier.  rf_we/aux_we from
 			// the completing instruction have reached the register file by
 			// the time S_EXC0 runs on the following qualified edge.
-			S_POST_EXC: state <= S_EXC0;
+			S_POST_EXC:    state <= S_EXC0;
+			S_POST_EXC_F2: state <= S_EXC0_F2;
+			S_POST_EXC_F3: state <= S_EXC0_F3;
+			S_POST_EXC_F4: state <= S_EXC0_F4;
 
 			// Extension-word fetch, the queue's second consumer.  A longword
 			// immediate whose two words are both available is taken in one
@@ -2749,38 +2795,14 @@ always @(posedge clk) begin
 				end
 			end
 
-			S_EXC0: begin
-				if (fpu_bg) state <= S_EXC0;   // FSAVE-quiescent exception
-				// An abandoned queue fetch may still be on the bus under the
-				// pre-exception function code.  Exception processing owns the
-				// port from in_exc onwards, so let it retire first.
-				else if (epf_pend) state <= S_EXC0;
-				else begin : exc0_run
-				// Kill any address-register rollback records on the way into
-				// a non-access exception.  The records exist solely so the
-				// access-error path can restore the FAULTING instruction's
-				// (An)+/-(An) side effects; only fetch_next and the S_AERR
-				// consumer clear them, and an instruction whose EA succeeded
-				// but which then raises CHK / zero-divide / an FP trap
-				// reaches here with its record still live.  Left alone it
-				// survives exception_prefetch into the handler, where the
-				// next access error "rolls back" an unrelated instruction's
-				// register to a stale value -- possibly from the other
-				// privilege context.
-				u0_v <= 0;
-				u1_v <= 0;
-				sr_saved <= sr;
-				sr[13] <= 1;
-				sr[15:14] <= 2'b00;
-				in_exc <= 1;
-				if (exc_is_irq) begin
-					sr[10:8] <= irq_lvl_l;
-					if (irq_lvl_l == 3'd7) nmi_ack_t <= ~nmi_ack_t;
-					else irq_ack_t <= ~irq_ack_t;
-				end
-				state <= S_EXC1;
-				end
-			end
+			// An abandoned queue fetch may still be on the bus under the
+			// pre-exception function code, and fpu_bg may still be making the
+			// FPU quiescent.  exc0_enter holds the encoded state until both
+			// conditions clear, then snapshots the exception context.
+			S_EXC0:    exc0_enter(4'd0);
+			S_EXC0_F2: exc0_enter(4'd2);
+			S_EXC0_F3: exc0_enter(4'd3);
+			S_EXC0_F4: exc0_enter(4'd4);
 
 			S_EXC1: begin
 				exc_sp <= dbg_a7 - exc_fsize;
@@ -2867,7 +2889,7 @@ always @(posedge clk) begin
 					// returns to that handler address.
 					pc <= m_val;
 					exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-					exc_fmt <= 0; exc_spc <= m_val; exc_addr <= 0;
+					exc_spc <= m_val; exc_addr <= 0;
 					exc_is_irq <= 1; exc_pass2 <= 0;
 					irq_lvl_l <= irq_take_lvl;
 					epf_flush;
@@ -2953,7 +2975,7 @@ always @(posedge clk) begin
 					pc <= rte_pc;
 					pc_i <= rte_pc;
 					exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, rte_irq_lvl};
-					exc_fmt <= 0; exc_spc <= rte_pc; exc_addr <= 0;
+					exc_spc <= rte_pc; exc_addr <= 0;
 					exc_is_irq <= 1; exc_pass2 <= 0;
 					irq_lvl_l <= rte_irq_lvl;
 					epf_flush;
@@ -3824,7 +3846,9 @@ always @(posedge clk) begin
 								fpu_iawe <= 1;
 								go_fp_ea_fault(fp_op_in_hw(imm[6:0]) ||
 								               imm[12:10] == 3'd3);
-								state <= S_POST_EXC;
+								state <= (fp_op_in_hw(imm[6:0]) ||
+								          imm[12:10] == 3'd3) ?
+								         S_POST_EXC : S_POST_EXC_F2;
 							end
 							else begin
 								rr_a <= {1'b0, d_rn};
@@ -3840,7 +3864,8 @@ always @(posedge clk) begin
 							// unimplemented-instruction route even here.
 							fpu_iawe <= 1;
 							go_fp_ea_fault(fp_op_in_hw(imm[6:0]));
-							state <= S_POST_EXC;
+							state <= fp_op_in_hw(imm[6:0]) ?
+							         S_POST_EXC : S_POST_EXC_F2;
 						end
 						else if (ea_is_imm) begin
 							fpb <= 0;
@@ -3872,7 +3897,7 @@ always @(posedge clk) begin
 							if (imm[12:10] == 3'd3 || imm[12:10] == 3'd7) begin
 								fpu_iawe <= 1;
 								go_fp_unsupp(1'b1, 1'b1, 1'b0, 32'd0);
-								state <= S_POST_EXC;
+								state <= S_POST_EXC_F3;
 							end
 							// A data register cannot hold a double or
 							// extended result: the 68040 reports these as
@@ -4060,8 +4085,8 @@ always @(posedge clk) begin
 								    rf_rdata_a + {25'd0, adj});
 							go_fp_unsupp(1'b1, 1'b1, 1'b1,
 							    (d_mode == 3'b100) ?
-								    (rf_rdata_a - {25'd0, adj}) : rf_rdata_a);
-							state <= S_POST_EXC;
+							    (rf_rdata_a - {25'd0, adj}) : rf_rdata_a);
+							state <= S_POST_EXC_F3;
 						end
 						else begin fpu_req <= 1; state <= S_FPU_GO; end
 					end
@@ -4079,7 +4104,7 @@ always @(posedge clk) begin
 						fpu_iawe <= 1;
 						if (fp_force_unsupp) begin
 							go_fp_unsupp(1'b1, 1'b1, 1'b1, ea_addr);
-							state <= S_POST_EXC;
+							state <= S_POST_EXC_F3;
 						end
 						else begin fpu_req <= 1; state <= S_FPU_GO; end
 					end
@@ -4494,7 +4519,7 @@ always @(posedge clk) begin
 						exc(`AP040_VEC_TRAPCC, 4'd2, pc, pc_i);
 						// A signaling unordered predicate records BSUN even when
 						// disabled.  Delay entry so that FPSR write is visible.
-						if (fp_pred[4] && fpu_cc[0]) state <= S_POST_EXC;
+						if (fp_pred[4] && fpu_cc[0]) state <= S_POST_EXC_F2;
 					end
 					else fetch_next;
 				end
@@ -5987,7 +6012,7 @@ always @(posedge clk) begin
 			S_STOPPED: begin
 				if (irq_pend) begin
 					exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-					exc_fmt <= 0; exc_spc <= pc; exc_addr <= 0;
+					exc_spc <= pc; exc_addr <= 0;
 					exc_is_irq <= 1; exc_pass2 <= 0;
 					irq_lvl_l <= irq_take_lvl;
 					epf_flush;
