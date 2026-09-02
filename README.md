@@ -78,6 +78,13 @@ Three groups of ports are optional and can be tied off:
   flat simulation environments.
 - **`mmu_*`, `cacr_out`, `vbr_out`, `debug_*`** — observation only.
 
+The data cache is write-through. An aligned cacheable store updates a matching
+resident longword only after the external write is acknowledged, preserving
+the other ways in that set. Cache-inhibited, misaligned, and line-crossing
+stores retain the conservative set-invalidation path. CPU writes deliberately
+do not snoop the instruction cache; self-modifying code must execute CINV, as
+on the MC68040.
+
 `dpram` is a plain inferred true-dual-port RAM. Replace it with a vendor
 macro (altsyncram, XPM) if your flow needs one; the ports are
 `clock, address_a, data_a, wren_a, q_a, address_b, data_b, wren_b, q_b` with

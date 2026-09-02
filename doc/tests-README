@@ -9,6 +9,10 @@ Testbenches (Icarus Verilog -g2012 and ModelSim, see run_tests.sh):
   tb_ap040_bus16_gap.v  split-transfer integration: models the RAM/cache
                         controllers' held acknowledge and requires a sampled
                         IDLE boundary between accepted 16-bit subcycles
+  tb_ap040_cache_snoop.v cache/DMA collision coverage, retained-line fills,
+                        and write-through store hits: byte/word/long merges
+                        update only the matching resident way after memory
+                        acknowledge, while a fault leaves cached data intact
   tb_sdram_turbo.v     full t_fpu through cpu_wrapper, cpu_cache_new and
                         sdram_ctrl at the board's phase-locked 28/114 MHz
                         ratio, including periodic chipset DMA contention
@@ -133,11 +137,13 @@ Implementation status and remaining gaps (milestones B-H complete):
     register rollback. MOVEM restart across a page fault is covered by
     t_mmu.s (the CM continuation bit is never set, which handlers treat as
     a plain restart)
-  - caches are write-through with invalidate-on-write, so CPUSH equals
-    CINV and no copyback/push state exists; CINV/CPUSH invalidate the
-    whole selected cache regardless of scope (architecturally safe);
-    misaligned and line-crossing reads bypass the caches; the I-cache is
-    not snooped by CPU writes (real 68040 behavior: software must CINV)
+  - caches are write-through, so CPUSH equals CINV and no copyback/push state
+    exists. Aligned cacheable store hits update only their matching resident
+    data-cache word after the external write acknowledges; complex and
+    cache-inhibited stores invalidate their touched sets. CINV/CPUSH invalidate
+    the whole selected cache regardless of scope (architecturally safe);
+    misaligned and line-crossing reads bypass the caches; the I-cache is not
+    snooped by CPU writes (real 68040 behavior: software must CINV)
   - the Minimig build sets AP040_ENABLE_CACHE=0 in cpu_wrapper.v: the
     internal caches are compiled out (CINV/CPUSH complete immediately,
     which is a valid 68040 whose caches never fill) and cpu_cache_new in

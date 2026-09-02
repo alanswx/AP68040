@@ -27,6 +27,8 @@
 //   T10       a completed-line sideband arriving with the first memory beat
 //             must populate the fill tail locally, preserve late CPU ack,
 //             and leave the completed line hitting without more bus traffic.
+//   T11       an aligned write-through hit updates only its matching cached
+//             longword and preserves all other ways in the same set.
 //
 // Every test reprograms memory behind the cache and requires the next
 // read to return the NEW value: a stale cached longword is the failure
@@ -265,6 +267,29 @@ task cpu_write;
 		end
 		if (guard >= 200) begin
 			$display("FAIL: write timeout at %h", a);
+			errors = errors + 1;
+		end
+		@(negedge clk);
+		c_req = 0; c_write = 0;
+		@(posedge clk);
+	end
+endtask
+
+task cpu_write_sized;
+	input [31:0] a;
+	input  [1:0] sz;
+	input [31:0] d;
+	integer guard;
+	begin
+		@(negedge clk);
+		c_req = 1; c_write = 1; c_size = sz; c_addr = a; c_wdata = d;
+		guard = 0;
+		while (!(c_ack && ce) && guard < 200) begin
+			@(posedge clk);
+			guard = guard + 1;
+		end
+		if (guard >= 200) begin
+			$display("FAIL: sized write timeout at %h", a);
 			errors = errors + 1;
 		end
 		@(negedge clk);
@@ -705,6 +730,53 @@ initial begin
 	expect_read(32'h0000_E00C, mem[32'hE00C>>2], 10);
 	if (mread_count != line_base) begin
 		$display("FAIL test 10: completed-line hits issued %0d extra reads",
+		         mread_count - line_base);
+		errors = errors + 1;
+	end
+
+	//------------------------------------------------------------------
+	// T11: fill four tags in one set, update one with a CPU store, then
+	// require every line to hit.  The old invalidate-on-write policy
+	// discarded the whole set and generated four new line fills here.
+	//------------------------------------------------------------------
+	cinv_req = 1; cinv_ic = 1; cinv_dc = 1;
+	@(negedge clk);
+	while (!cinv_done) @(posedge clk);
+	cinv_req = 0;
+	repeat (4) @(posedge clk);
+
+	mem[32'h1000>>2] = 32'h1111_A001;
+	mem[32'h2000>>2] = 32'h2222_A002;
+	mem[32'h3000>>2] = 32'h3333_A003;
+	mem[32'h4000>>2] = 32'h4444_A004;
+	expect_read(32'h0000_1000, 32'h1111_A001, 11);
+	expect_read(32'h0000_2000, 32'h2222_A002, 11);
+	expect_read(32'h0000_3000, 32'h3333_A003, 11);
+	expect_read(32'h0000_4000, 32'h4444_A004, 11);
+
+	cpu_write(32'h0000_2000, 32'hBEEF_2000);
+	line_base = mread_count;
+	expect_read(32'h0000_2000, 32'hBEEF_2000, 11);
+	expect_read(32'h0000_1000, 32'h1111_A001, 11);
+	expect_read(32'h0000_3000, 32'h3333_A003, 11);
+	expect_read(32'h0000_4000, 32'h4444_A004, 11);
+
+	// Big-endian byte and word lanes merge into that same resident word.
+	cpu_write_sized(32'h0000_2001, 2'b00, 32'h0000_00AA);
+	expect_read(32'h0000_2000, 32'hBEAA_2000, 11);
+	cpu_write_sized(32'h0000_2002, 2'b01, 32'h0000_CCDD);
+	expect_read(32'h0000_2000, 32'hBEAA_CCDD, 11);
+
+	// A failed write must not commit its speculative lookup data.
+	err_arm = 1;
+	err_addr = 32'h0000_2000;
+	err_beat = 0;
+	cpu_access_berr(32'h0000_2000, 1'b1);
+	err_arm = 0;
+	expect_bus_idle(11);
+	expect_read(32'h0000_2000, 32'hBEAA_CCDD, 11);
+	if (mread_count != line_base) begin
+		$display("FAIL test 11: store-hit update caused %0d refill reads",
 		         mread_count - line_base);
 		errors = errors + 1;
 	end

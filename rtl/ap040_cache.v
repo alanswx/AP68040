@@ -4,12 +4,13 @@
 // ap040_cache.v - internal instruction and data caches (milestone G)       //
 //                                                                          //
 // 4KB per side: 64 sets x 4 ways x 16 byte lines, physically tagged        //
-// (sits between the MMU and the 16-bit bus adapter). Write-through with    //
-// invalidate-on-write: writes always go to memory and clear any matching   //
-// data cache set, so no dirty state ever exists and CPUSH degenerates to   //
-// CINV. Cacheable reads must fit inside one aligned longword; misaligned   //
-// and line-crossing accesses, walker cycles and cache-inhibited pages      //
-// bypass the cache entirely.                                               //
+// (sits between the MMU and the 16-bit bus adapter). Write-through: an      //
+// aligned cacheable store updates a resident data-cache word while still   //
+// going to memory. Complex or cache-inhibited writes invalidate their      //
+// touched sets, so no dirty state ever exists and CPUSH degenerates to      //
+// CINV. Cacheable reads must fit inside one aligned longword; misaligned    //
+// and line-crossing accesses, walker cycles and cache-inhibited pages       //
+// bypass the cache entirely.                                                //
 //                                                                          //
 // The instruction cache is not snooped by CPU writes (as on the real       //
 // 68040): self-modifying code must execute CINV, which invalidates the     //
@@ -205,8 +206,10 @@ reg  [31:0] r_addr;
 reg   [1:0] r_size;
 reg   [1:0] r_off;
 reg  [31:0] fill_hold;           // requested longword captured during fill
+reg  [31:0] r_wdata;             // captured aligned store data for hit update
 reg         ack_r;
 reg  [31:0] rdata_r;
+reg         pass_store_chk;      // C_PASS owns an aligned store tag lookup
 
 wire [21:0] t_w0 = tag_q[21:0];
 wire [21:0] t_w1 = tag_q[43:22];
@@ -240,6 +243,31 @@ function [31:0] lw_extract;
 			`AP040_SZ_W:
 				lw_extract = off[1] ? {16'd0, lw[15:0]} : {16'd0, lw[31:16]};
 			default: lw_extract = lw;
+		endcase
+	end
+endfunction
+
+// Merge right-aligned store data into a cached big-endian longword.  This is
+// used only for fits_long stores, so a word is even and no operand crosses a
+// longword boundary.
+function [31:0] lw_merge;
+	input [31:0] old_lw;
+	input [31:0] new_data;
+	input  [1:0] size;
+	input  [1:0] off;
+	begin
+		case (size)
+			`AP040_SZ_B:
+				case (off)
+					2'd0: lw_merge = {new_data[7:0], old_lw[23:0]};
+					2'd1: lw_merge = {old_lw[31:24], new_data[7:0], old_lw[15:0]};
+					2'd2: lw_merge = {old_lw[31:16], new_data[7:0], old_lw[7:0]};
+					default: lw_merge = {old_lw[31:8], new_data[7:0]};
+				endcase
+			`AP040_SZ_W:
+				lw_merge = off[1] ? {old_lw[31:16], new_data[15:0]}
+				                      : {new_data[15:0], old_lw[15:0]};
+			default: lw_merge = new_data;
 		endcase
 	end
 endfunction
@@ -288,11 +316,19 @@ end
 wire pass_active = (cst == C_PASS);
 wire fill_active = (cst == C_FILL);
 
+// Aligned writes to an enabled, cacheable data line may update a matching
+// cached word.  They still pass through to memory; only the needless
+// invalidate/refill cycle is removed.  Every other write keeps the existing
+// conservative set-invalidate path.
+wire store_update_ok = c_write && !c_instr && de && !c_nocache && fits_long;
+
 // Set when a transfer this cache issued took a bus error; cleared when
 // the core withdraws the faulted request.  Without it the level-held
 // request would be re-accepted on the very next cycle and re-issued to
 // the address that just faulted.
 reg  err_hold;
+wire store_lookup_accept = (cst == C_IDLE) && c_req && !ack_r &&
+	                         !err_hold && !store_inv_lost && store_update_ok;
 // A cache-inhibited READ that hits a resident line must invalidate it
 // while it bypasses (WinUAE dcache040: a hit under CACHE_DISABLE_MMU is
 // pushed and invalidated before the uncached access; the icache path
@@ -346,15 +382,16 @@ assign tag_widx  = (cst == C_SWEEP) ? sweep_cnt : r_row;
 assign tag_wdat  = (cst == C_SWEEP) ? {ROWW{1'b0}}
                                     : {tag_q[93:92] + 2'd1, val_next, tags_next};
 
-// Port B: a store invalidates the data-bank set it touches, and the next
-// set when the transfer crosses the line.  A cleared row needs no
-// read-modify-write -- the tags left behind are never consulted without
-// their valid bit.  The 68040 leaves the instruction cache alone here.
+// Port B: a complex or uncacheable store invalidates the data-bank set it
+// touches, and the next set when the transfer crosses the line.  A cleared
+// row needs no read-modify-write -- the tags left behind are never consulted
+// without their valid bit.  Aligned cacheable stores use the hit-update path
+// below instead.  The 68040 leaves the instruction cache alone here.
 // Port B invalidates: a snoop takes priority over a store's own
 // invalidate, because a missed snoop leaves stale data while a delayed
 // store invalidate is picked up again from snoop_pend below.
 wire store_inv = ((cst == C_IDLE) && c_req && c_write && !ack_r &&
-                  !store_inv_lost) ||
+	                  !store_inv_lost && !store_update_ok) ||
                  ((cst == C_PASS) && winv_pend) ||
                  (cst == C_WINV);
 // Snoop invalidates are FREE-RUNNING (5.1): a chipset write must land
@@ -387,17 +424,22 @@ assign inv_idx  = snoop_wr        ? {1'b0, s_addr[9:4]} :
                   ci_inv          ? ci_inv_row :
                   store_inv_lost ? {1'b0, store_inv_set} :
                   (cst == C_IDLE) ? {1'b0, c_addr[9:4]} : {1'b0, winv_set2};
-assign cd_rd_en  = rd_accept;                       // issued with the tag read
-assign cd_ridx   = {c_instr, a_set, c_addr[3:2]};
-assign cd_we     = (((cst == C_FILL) && r_issued && m_ack) || fill_line_write)
-                   ? (4'd1 << r_way) : 4'd0;
-assign cd_widx   = {r_bank, r_row[5:0], r_beat};
-assign cd_wdat   = fill_line_write ? fill_line_word : m_rdata;
 
 // the four ways arrive together; the tag compare picks one
 wire [31:0] data_hit = (hit_way == 2'd0) ? data_q0 :
                        (hit_way == 2'd1) ? data_q1 :
                        (hit_way == 2'd2) ? data_q2 : data_q3;
+
+assign cd_rd_en  = rd_accept || store_lookup_accept; // issued with tag lookup
+assign cd_ridx   = {c_instr, a_set, c_addr[3:2]};
+wire store_hit_write = (cst == C_PASS) && pass_store_chk && m_ack && look_hit;
+assign cd_we     = store_hit_write
+	                  ? (4'd1 << hit_way) :
+	                ((((cst == C_FILL) && r_issued && m_ack) || fill_line_write)
+	                  ? (4'd1 << r_way) : 4'd0);
+assign cd_widx   = {r_bank, r_row[5:0], r_beat};
+assign cd_wdat   = store_hit_write ? lw_merge(data_hit, r_wdata, r_size, r_off) :
+	                  (fill_line_write ? fill_line_word : m_rdata);
 
 
 
@@ -419,7 +461,8 @@ always @(posedge clk) begin
 		cinv_done <= 0;
 		r_row <= 0; r_tag <= 0; r_word <= 0; r_way <= 0; r_bank <= 0;
 		r_beat <= 0; r_issued <= 0; r_addr <= 0; r_size <= 0; r_off <= 0;
-		fill_hold <= 0; ack_r <= 0; rdata_r <= 0;
+		fill_hold <= 0; r_wdata <= 0; pass_store_chk <= 0;
+		ack_r <= 0; rdata_r <= 0;
 	end
 	else if (ce) begin
 		ack_r <= 0;
@@ -434,7 +477,7 @@ always @(posedge clk) begin
 		// (store_inv's !store_inv_lost term), so the single slot cannot
 		// be overwritten.
 		if (snoop_wr && (cst == C_IDLE) && c_req && c_write && !ack_r &&
-		    !store_inv_lost) begin
+		    !store_inv_lost && !store_update_ok) begin
 			store_inv_lost <= 1;
 			store_inv_set  <= c_addr[9:4];
 		end
@@ -460,8 +503,9 @@ always @(posedge clk) begin
 				// blocks ci_inv; holding the store as well made the two
 				// block each other with no way out -- a hard wedge, the
 				// worst possible failure for a cache.  A store needs no
-				// exemption from the guarantee anyway: it never reads
-				// data_q, and it clears its own row on acceptance.
+				// exemption from the guarantee anyway: an aligned store
+				// lookup can only update a still-valid matching way, while
+				// every other store clears its own row on acceptance.
 				// Exempting it also lets ci_inv fire the moment the FSM
 				// leaves C_IDLE.
 				//
@@ -486,15 +530,29 @@ always @(posedge clk) begin
 							// be skipped (the request is level-held)
 						end
 						else begin
-						// write-through.  Port B clears the set this store
-						// touches in this acceptance cycle; a store crossing
-						// the line owes a second one, taken during the pass
-						// wait or in C_WINV.  The transfer itself is issued
-						// from C_PASS (see pass_active), so no ack can land
-						// in this cycle.
-						winv_set2 <= c_addr[9:4] + 6'd1;
-						winv_pend <= write_cross_line;
-						cst <= C_PASS;
+							// A simple cacheable store reads its tag and all four
+							// data ways here, then merges into a matching word only
+							// when memory acknowledges it in C_PASS.  A fault can
+							// therefore never leave uncommitted data in the cache.
+							pass_store_chk <= store_update_ok;
+							if (store_update_ok) begin
+								r_row   <= {1'b0, a_set};
+								r_tag   <= a_tag;
+								r_bank  <= 0;
+								r_beat  <= c_addr[3:2];
+								r_size  <= c_size;
+								r_off   <= c_addr[1:0];
+								r_wdata <= c_wdata;
+								winv_pend <= 0;
+							end
+							else begin
+								// Complex or uncacheable write: Port B clears the
+								// touched set now and the next set, if crossed,
+								// during the pass wait or in C_WINV.
+								winv_set2 <= c_addr[9:4] + 6'd1;
+								winv_pend <= write_cross_line;
+							end
+							cst <= C_PASS;
 						end
 					end
 					else if (bypass) begin
@@ -533,6 +591,7 @@ always @(posedge clk) begin
 					end
 				end
 				if (m_err) begin
+					pass_store_chk <= 0;
 					// a passed access faulted: release the bus, but a
 					// still-owed invalidate is honoured (invalidating
 					// more is always safe under write-through)
@@ -540,8 +599,11 @@ always @(posedge clk) begin
 					cst <= (winv_pend && (s_stb || store_inv_lost))
 					       ? C_WINV : C_IDLE;
 				end
-				else if (m_ack) cst <= (winv_pend && (s_stb || store_inv_lost))
-				                  ? C_WINV : C_IDLE;
+				else if (m_ack) begin
+					pass_store_chk <= 0;
+					cst <= (winv_pend && (s_stb || store_inv_lost))
+					       ? C_WINV : C_IDLE;
+				end
 			end
 
 			C_FERR: begin
