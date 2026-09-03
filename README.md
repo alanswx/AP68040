@@ -94,6 +94,35 @@ context and is invalidated by every architectural prefetch flush, including
 exceptions, CINV, PFLUSH, MOVEC, and context changes. Ordinary branches preserve
 it deliberately.
 
+Several common paths also avoid redundant sequencer states. Simple address-
+register effective addresses are selected during decode, memory operands can
+retire on their successful acknowledgement when no later architectural work is
+required, prefetched DBcc loops skip a separate decrement state, and ordinary
+non-crossing memory-to-register MOVE/MOVEA operations retire on the read
+acknowledgement. The common `ADD.L Dn,Dn` form selects both register-file ports
+in decode and skips its otherwise empty pipeline-setup state. Faults, page
+crossings, trace/interrupt boundaries, and the generic pipeline retain their
+conservative paths.
+
+### Performance development
+
+Performance changes are accepted one opcode family or transaction class at a
+time. The host project runs this standalone suite, its full-machine Verilator
+model, the first 100 differential SingleStepTests CPU rows, a timing-clean
+Quartus fit, and the complete Speedometer 3.23 PR suite on a DE10-Nano. A
+simulation-only cycle win is not sufficient: one broader register-register
+retirement experiment passed simulation and timing but froze during Mac OS
+startup, so it remains rejected.
+
+In the Wombat33 seed-27 fit at commit `2b3634d`, the complete CPU hierarchy
+accounts for about 24,783 ALMs; `ap040_core` accounts for about 23,565, of
+which about 15,947 are the core's own sequencer/decode logic. The complete
+host design is already at 40,755/41,910 ALMs and 4,183/4,191 LABs. Reducing
+the core's decode/state muxing is therefore a prerequisite for comfortable
+routing and larger pipeline changes, even though an area reduction alone does
+not make an instruction execute faster. The host project's
+`CPU_PERFORMANCE_TASKS.md` is the authoritative queue and recovery record.
+
 `dpram` is a plain inferred true-dual-port RAM. Replace it with a vendor
 macro (altsyncram, XPM) if your flow needs one; the ports are
 `clock, address_a, data_a, wren_a, q_a, address_b, data_b, wren_b, q_b` with
