@@ -2304,8 +2304,20 @@ always @(posedge clk) begin
 					else aerr_start;
 				end
 				else if (d_ack) begin
-					m_val <= mem_rdata;
-					state <= r_m_ret;
+					// The common memory-source/register-destination path has
+					// already parked port B on the destination register in
+					// S_PIPE_SRD.  Capture both operands directly when the read
+					// completes instead of spending S_PIPE_SDONE copying m_val.
+					// Split page-crossing reads retain the generic path below.
+					if (r_m_ret == S_PIPE_SDONE && p_dst == DK_REG) begin
+						src_val <= mem_rdata;
+						dst_val <= rf_rdata_b;
+						state <= S_EXEC;
+					end
+					else begin
+						m_val <= mem_rdata;
+						state <= r_m_ret;
+					end
 				end
 			end
 
