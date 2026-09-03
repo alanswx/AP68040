@@ -1540,6 +1540,10 @@ task ea_start;
 	input [7:0] ret;
 	begin
 		ea_mode <= mode; ea_rn <= rn; ea_size <= size;
+		// Select An while entering the EA engine.  The asynchronous register
+		// file output is then settled when S_EA_DISP handles the simple An
+		// modes, avoiding a separate base-register state.
+		rr_a <= {1'b1, rn};
 		ea_pcmode <= 0; ea_pcb <= pc;
 		r_ea_ret <= ret; state <= S_EA_DISP;
 	end
@@ -2352,16 +2356,26 @@ always @(posedge clk) begin
 			//------------------------------------------------------- EA engine
 			S_EA_DISP: begin
 				case (ea_mode)
-					3'b010, 3'b011, 3'b100: begin
-						rr_a <= {1'b1, ea_rn};
-						state <= S_EA_BASE;
+					3'b010: begin
+						ea_addr <= rf_rdata_a;
+						state <= r_ea_ret;
+					end
+					3'b011: begin
+						ea_addr <= rf_rdata_a;
+						rfw({1'b1, ea_rn}, rf_rdata_a + an_adj(ea_rn, ea_size));
+						u_rec({1'b1, ea_rn}, rf_rdata_a);
+						state <= r_ea_ret;
+					end
+					3'b100: begin
+						ea_addr <= rf_rdata_a - an_adj(ea_rn, ea_size);
+						rfw({1'b1, ea_rn}, rf_rdata_a - an_adj(ea_rn, ea_size));
+						u_rec({1'b1, ea_rn}, rf_rdata_a);
+						state <= r_ea_ret;
 					end
 					3'b101: begin
-						rr_a <= {1'b1, ea_rn};
 						immf(2'd1, S_EA_D16);
 					end
 					3'b110: begin
-						rr_a <= {1'b1, ea_rn};
 						immf(2'd1, S_EA_EXTW);
 					end
 					default: begin // 111
@@ -2374,23 +2388,6 @@ always @(posedge clk) begin
 						endcase
 					end
 				endcase
-			end
-
-			S_EA_BASE: begin
-				case (ea_mode)
-					3'b010: ea_addr <= rf_rdata_a;
-					3'b011: begin
-						ea_addr <= rf_rdata_a;
-						rfw({1'b1, ea_rn}, rf_rdata_a + an_adj(ea_rn, ea_size));
-						u_rec({1'b1, ea_rn}, rf_rdata_a);
-					end
-					default: begin // 100
-						ea_addr <= rf_rdata_a - an_adj(ea_rn, ea_size);
-						rfw({1'b1, ea_rn}, rf_rdata_a - an_adj(ea_rn, ea_size));
-						u_rec({1'b1, ea_rn}, rf_rdata_a);
-					end
-				endcase
-				state <= r_ea_ret;
 			end
 
 			S_EA_D16: begin
