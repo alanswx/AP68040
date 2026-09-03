@@ -85,6 +85,15 @@ stores retain the conservative set-invalidation path. CPU writes deliberately
 do not snoop the instruction cache; self-modifying code must execute CINV, as
 on the MC68040.
 
+The instruction front end retains one 32-byte sector of completed fetch data.
+On a control-flow redirect, four contiguous valid words at the target can seed
+the execution prefetch queue without another cache/MMU handshake. This is most
+useful for short backwards loops; normal forward filling resumes once the
+seeded words drain. The sector is tagged by logical address and supervisor
+context and is invalidated by every architectural prefetch flush, including
+exceptions, CINV, PFLUSH, MOVEC, and context changes. Ordinary branches preserve
+it deliberately.
+
 `dpram` is a plain inferred true-dual-port RAM. Replace it with a vendor
 macro (altsyncram, XPM) if your flow needs one; the ports are
 `clock, address_a, data_a, wren_a, q_a, address_b, data_b, wren_b, q_b` with

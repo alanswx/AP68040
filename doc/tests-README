@@ -608,3 +608,20 @@ write.  These are instances of the v20 omitted-memory-transition defect
 described in `diff/README`, not evidence for an RTL unary-rounding or
 underflow change.  The failures remain visible; the harness does not xfail or
 mask them.
+
+Instruction branch-refill buffer (2026-09-02)
+----------------------------------------------
+A one-sector instruction refill buffer now keeps completed fetch words across
+ordinary control-flow redirects and seeds the prefetch queue when all four
+words beginning at the new PC are present.  The complete-window requirement
+keeps partial prefixes off the redirect path.  Exceptions and all other
+architectural prefetch flushes invalidate the sector; a branch redirect alone
+does not.
+
+The complete directed suite passes, including reset/double-fault, walker CDC,
+16-bit bus gaps and timeouts, cache/snoop, integer, exception, MMU, cache, and
+FPU tests.  Wombat's first 100 SingleStepTests CPU rows compare 1,696
+architectural field groups with zero real differences.  `bench_loop` improves
+from 326,674 to 289,956 clocks (11.24 percent), while the phase-0 result is
+289,178 clocks.  A timing-clean Cyclone V integration at placement seed 24
+also booted Mac OS 7.5.5 and completed every Speedometer 3.23 PR category.

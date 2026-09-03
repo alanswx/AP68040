@@ -588,6 +588,22 @@ reg        epf_pend;             // a queue fetch is outstanding
 reg        epf_pend_lw;          // ... and it returns two words
 reg        epf_kill;             // ... whose data a flush has abandoned
 reg        epf_err;              // the fill engine faulted: re-issue on demand
+reg        epf_brf;              // queue was seeded by branch-refill buffer
+
+// Small instruction branch-refill buffer.  The main queue is forward-only:
+// a taken backwards branch otherwise discards its words and pays another
+// cache/MMU handshake even when a tight loop was fetched only moments ago.
+// One 32-byte sector retains recently completed instruction fetches and can
+// seed up to four contiguous words at a redirect target.  A shared tag keeps
+// both the loop target and modest forward prefetch resident without the cost
+// of two independent tag comparators.  It is tagged by logical address and
+// supervisor context, and every
+// architectural queue flush (exception, CINV, PFLUSH, MOVEC, context change)
+// invalidates them.  Ordinary control-flow redirects deliberately do not.
+reg [31:0] brf_data [0:7];
+reg [26:0] brf_tag;
+reg        brf_super;
+reg [15:0] brf_valid;
 
 // Combinational within the state machine's always block: the port claim and
 // the flush both have to be visible to the fill engine, which runs after the
@@ -1338,6 +1354,8 @@ task epf_flush;
 		epf_fill  <= 0;
 		epf_armed <= 0;
 		epf_err   <= 0;
+		epf_brf   <= 0;
+		brf_valid <= 0;
 		if (epf_pend) epf_kill <= 1;
 		epf_flushed = 1;
 	end
@@ -1350,22 +1368,55 @@ endtask
 task issue_ifetch;
 	input [31:0] a;
 	input        s;
+	reg line_hit, refill_hit;
 	begin
+		line_hit = brf_tag == a[31:5] && brf_super == s;
+		refill_hit = line_hit && a[4:1] <= 4'd12 &&
+		             brf_valid[a[4:1]] &&
+		             brf_valid[a[4:1] + 4'd1] &&
+		             brf_valid[a[4:1] + 4'd2] &&
+		             brf_valid[a[4:1] + 4'd3];
 		if (epf_armed && epf_next == a && epf_super == s) begin
 			// the stream already runs here: nothing to do
+			// A drained branch-refill stream reached its fall-through path;
+			// allow normal speculative filling to resume.
+			if (epf_count == 4'd0) epf_brf <= 0;
 		end
 		else begin
-			epf_count <= 0;
 			epf_head  <= 0;
-			epf_fill  <= 0;
 			epf_err   <= 0;
 			epf_next  <= a;
-			epf_ftail <= a;
 			epf_super <= s;
 			epf_armed <= 1;
 			epf_flushed = 1;
 			if (epf_pend) epf_kill <= 1;
-			else if (!mem_req && !mem_ack) begin
+			else epf_kill <= 0;
+			if (refill_hit) begin
+				epf_brf <= 1;
+				// Four words cover the canonical two-op DBcc loop.  Requiring
+				// the complete window keeps partial prefixes off the redirect path.
+				if (a[1]) begin
+					epf_data[0] <= brf_data[a[4:2]][15:0];
+					epf_data[1] <= brf_data[a[4:2] + 3'd1][31:16];
+					epf_data[2] <= brf_data[a[4:2] + 3'd1][15:0];
+					epf_data[3] <= brf_data[a[4:2] + 3'd2][31:16];
+				end
+				else begin
+					epf_data[0] <= brf_data[a[4:2]][31:16];
+					epf_data[1] <= brf_data[a[4:2]][15:0];
+					epf_data[2] <= brf_data[a[4:2] + 3'd1][31:16];
+					epf_data[3] <= brf_data[a[4:2] + 3'd1][15:0];
+				end
+				epf_count <= 4'd4; epf_fill <= 3'd4;
+				epf_ftail <= a + 32'd8;
+			end
+			else begin
+				epf_brf   <= 0;
+				epf_count <= 0;
+				epf_fill  <= 0;
+				epf_ftail <= a;
+			end
+			if (!refill_hit && !epf_pend && !mem_req && !mem_ack) begin
 				// The port is free: issue the redirect now rather than
 				// leaving it to the engine one cycle later.  A longword
 				// aligned fetch takes both words in one request.  Alignment
@@ -1903,8 +1954,10 @@ always @(posedge clk) begin
 		epf_count <= 0; epf_head <= 0; epf_fill <= 0;
 		epf_base <= 0; epf_next <= 0; epf_super <= 0;
 		epf_ftail <= 0; epf_armed <= 0; epf_pend <= 0;
-		epf_pend_lw <= 0; epf_kill <= 0; epf_err <= 0;
+		epf_pend_lw <= 0; epf_kill <= 0; epf_err <= 0; epf_brf <= 0;
 		for (li = 0; li < 8; li = li + 1) epf_data[li] <= 0;
+		for (li = 0; li < 8; li = li + 1) brf_data[li] <= 0;
+		brf_tag <= 0; brf_super <= 0; brf_valid <= 0;
 		m_wr <= 0; m_size <= 0; m_addr_r <= 0; m_wdat <= 0; m_val <= 0;
 		ea_mode <= 0; ea_rn <= 0; ea_size <= 0;
 		ea_pcmode <= 0; ea_pcb <= 0; extw <= 0;
@@ -6062,6 +6115,23 @@ always @(posedge clk) begin
 					epf_data[epf_fill] <= mem_rdata[15:0];
 					epf_fillw = 2'd1;
 				end
+				// A longword instruction fetch is naturally aligned and never
+				// crosses a 32-byte sector, so both returned words update one entry.
+				if (epf_pend_lw)
+					brf_data[mem_addr[4:2]] <= mem_rdata;
+				else if (mem_addr[1])
+					brf_data[mem_addr[4:2]][15:0] <= mem_rdata[15:0];
+				else
+					brf_data[mem_addr[4:2]][31:16] <= mem_rdata[15:0];
+				if (brf_tag == mem_addr[31:5] && brf_super == epf_super) begin
+					brf_valid[mem_addr[4:1]] <= 1;
+					if (epf_pend_lw) brf_valid[mem_addr[4:1] + 4'd1] <= 1;
+				end
+				else brf_valid <= (epf_pend_lw ? 16'b0000_0000_0000_0011
+				                               : 16'b0000_0000_0000_0001)
+				                       << mem_addr[4:1];
+				brf_tag <= mem_addr[31:5];
+				brf_super <= epf_super;
 			end
 		end
 		else if (epf_pend && i_err) begin
@@ -6104,6 +6174,8 @@ always @(posedge clk) begin
 		// keeps a stale lk_cyc after a faulted CAS from starving the
 		// handler's first instruction.
 		else if (epf_armed && !epf_pend && !epf_err &&
+		         (!epf_brf || (epf_count == 4'd0 &&
+		                       (state == S_FETCH || state == S_IMMF))) &&
 		         !epf_issue && !epf_flushed &&
 		         !mem_req && !mem_ack &&
 		         (!lk_cyc || state == S_IMMF) &&
@@ -6122,6 +6194,7 @@ always @(posedge clk) begin
 		         !ea_state &&
 		         (epf_ftail[1] ? (epf_count <= 4'd7) : (epf_count <= 4'd6)))
 		begin
+			epf_brf <= 0;
 			mem_req <= 1; mem_write <= 0; mem_instr <= 1;
 			mem_size <= epf_ftail[1] ? `AP040_SZ_W : `AP040_SZ_L;
 			mem_addr <= epf_ftail;
