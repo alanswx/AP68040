@@ -1888,8 +1888,6 @@ endtask
 // main state machine
 //---------------------------------------------------------------------------
 
-integer li;
-
 always @(posedge clk) begin
 	// Combinational carriers, valid only inside this block: the fetch queue's
 	// fill engine runs after the case statement and has to see what the case
@@ -1959,8 +1957,9 @@ always @(posedge clk) begin
 		epf_base <= 0; epf_next <= 0; epf_super <= 0;
 		epf_ftail <= 0; epf_armed <= 0; epf_pend <= 0;
 		epf_pend_lw <= 0; epf_kill <= 0; epf_err <= 0; epf_brf <= 0;
-		for (li = 0; li < 8; li = li + 1) epf_data[li] <= 0;
-		for (li = 0; li < 8; li = li + 1) brf_data[li] <= 0;
+		// Queue/refill payload is invalid while the count/valid controls below
+		// are clear.  Do not reset it: payload reset muxes only consume FPGA
+		// packing resources and the words are overwritten before becoming valid.
 		brf_tag <= 0; brf_super <= 0; brf_valid <= 0;
 		m_wr <= 0; m_size <= 0; m_addr_r <= 0; m_wdat <= 0; m_val <= 0;
 		ea_mode <= 0; ea_rn <= 0; ea_size <= 0;
@@ -1988,7 +1987,7 @@ always @(posedge clk) begin
 		lk_cyc <= 0; aer_lk <= 0; aer_m16 <= 0; aer_tt <= 0; aer_wd <= 0;
 		m16_form <= 0; m16_dst_rn <= 0; m16_src <= 0; m16_dst <= 0;
 		m16_an <= 0; m16_idx <= 0; m16_rd_done <= 0;
-		for (li = 0; li < 4; li = li + 1) m16buf[li] <= 0;
+		// m16buf is filled completely before S_M16_WR can consume it.
 		rst_cnt <= 0;
 		fault_r <= 0;
 		nmi_ack_t <= 0;
@@ -4509,6 +4508,11 @@ always @(posedge clk) begin
 				else begin
 					fp_list <= fp_list & ~(8'd1 << b);
 					fpu_fmsel <= (!fp_st || fp_mode[1]) ? (3'd7 - b) : b;
+					// FMOVEM stores share the FPU's ordinary source-register
+					// read port.  S_FPU_MVM2 provides a full setup cycle before
+					// fm_rdata is consumed; loads still write through fm_sel.
+					if (fp_st)
+						fpu_srcr <= (!fp_st || fp_mode[1]) ? (3'd7 - b) : b;
 					if (fp_ea_pd) t_a <= t_a;   // base already lowered
 					fp_n <= 0;
 					state <= S_FPU_MVM2;
