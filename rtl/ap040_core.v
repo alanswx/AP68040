@@ -2475,7 +2475,34 @@ always @(posedge clk) begin
 				// read on port B in the SAME cycle the source is read on
 				// port A (X2.3).  The old path spent one state per port.
 				case (p_src)
-					SK_MEM: ea_start(src_mode_r, src_rn_r, p_ssize, S_PIPE_SRD);
+					SK_MEM: begin
+						// Decode already selected the source An.  Resolve the three
+						// simple modes here and bypass S_EA_DISP; extension-bearing
+						// modes retain the generic EA engine.
+						case (src_mode_r)
+							3'b010: begin
+								ea_addr <= rf_rdata_a;
+								state <= S_PIPE_SRD;
+							end
+							3'b011: begin
+								ea_addr <= rf_rdata_a;
+								rfw({1'b1, src_rn_r},
+								    rf_rdata_a + an_adj(src_rn_r, p_ssize));
+								u_rec({1'b1, src_rn_r}, rf_rdata_a);
+								state <= S_PIPE_SRD;
+							end
+							3'b100: begin
+								ea_addr <= rf_rdata_a - an_adj(src_rn_r, p_ssize);
+								rfw({1'b1, src_rn_r},
+								    rf_rdata_a - an_adj(src_rn_r, p_ssize));
+								u_rec({1'b1, src_rn_r}, rf_rdata_a);
+								state <= S_PIPE_SRD;
+							end
+							default:
+								ea_start(src_mode_r, src_rn_r, p_ssize,
+								         S_PIPE_SRD);
+						endcase
+					end
 					SK_REG:
 						if (p_dst == DK_REG) begin
 							rr_a <= p_sreg; rr_b <= p_dreg;
@@ -4937,6 +4964,11 @@ always @(posedge clk) begin
 
 			//---------------------------------------------------------- decode
 			S_DECODE: begin
+				// Generic source-memory forms all use the opcode's low An.
+				// Select it while decoding so simple An modes can consume the
+				// asynchronous port-A value as soon as the pipeline starts.
+				// Decode cases which need another register override this below.
+				rr_a <= {1'b1, d_rn};
 				case (ir_hi)
 					//-------------------------------------------- 0x0: bit/imm
 					4'h0: begin
