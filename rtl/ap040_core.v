@@ -3130,21 +3130,20 @@ always @(posedge clk) begin
 				// of cctrue): DBT to an odd label faults even though the
 				// loop exits without branching (cputest 68040_ae DBcc.W).
 				reg [31:0] tgt;
+				reg [15:0] w;
 				tgt = br_base + sxw(imm[15:0]);
 				if (tgt[0]) go_pc(tgt);
 				else if (cond_true(ir[11:8])) fetch_next;
 				else begin
-					rr_a <= {1'b0, d_rn};
-					state <= S_DBCC2;
+					// Decode selected Dn before fetching the displacement, so
+					// its combinational read has already settled on entry here.
+					// Commit the decrement and redirect together; go_pc's
+					// interrupt barrier preserves this same-edge writeback.
+					w = rf_rdata_a[15:0] - 16'd1;
+					rfw({1'b0, d_rn}, {rf_rdata_a[31:16], w});
+					if (w != 16'hFFFF) go_pc(tgt);
+					else fetch_next;
 				end
-			end
-
-			S_DBCC2: begin : dbcc2
-				reg [15:0] w;
-				w = rf_rdata_a[15:0] - 16'd1;
-				rfw({1'b0, d_rn}, {rf_rdata_a[31:16], w});
-				if (w != 16'hFFFF) go_pc(br_base + sxw(imm[15:0]));
-				else fetch_next;
 			end
 
 			//------------------------------------------- jumps and stack frame
@@ -5508,6 +5507,7 @@ always @(posedge clk) begin
 							if (d_mode == 3'b001) begin
 								// DBcc
 								br_base <= pc;
+								rr_a <= {1'b0, d_rn};
 								immf(2'd1, S_DBCC1);
 							end
 							else if (d_mode == 3'b111 && d_rn >= 3'b010 && d_rn <= 3'b100) begin
