@@ -2313,7 +2313,32 @@ always @(posedge clk) begin
 					// S_PIPE_SRD.  Capture both operands directly when the read
 					// completes instead of spending S_PIPE_SDONE copying m_val.
 					// Split page-crossing reads retain the generic path below.
-					if (r_m_ret == S_PIPE_SDONE && p_dst == DK_REG) begin
+					// A plain MOVE needs no destination-side ALU operand, so it can
+					// also retire here instead of taking the following S_EXEC slot.
+					// Keep this qualified by the actual MOVE opcode family: several
+					// system instructions reuse AP040_ALU_MOVE internally.
+					if (r_m_ret == S_PIPE_SDONE && p_src == SK_MEM &&
+					    p_dst == DK_REG && alu_op == `AP040_ALU_MOVE &&
+					    ir[15:14] == 2'b00 && ir[13:12] != 2'b00) begin : mrd_move_retire
+						reg [31:0] move_v;
+						move_v = p_sextw ? sxw(mem_rdata[15:0]) : mem_rdata;
+						if (p_flags) begin
+							case (op_size)
+								`AP040_SZ_B: sr[3:0] <= {mem_rdata[7],
+								                              mem_rdata[7:0] == 8'd0, 2'b00};
+								`AP040_SZ_W: sr[3:0] <= {mem_rdata[15],
+								                              mem_rdata[15:0] == 16'd0, 2'b00};
+								default:      sr[3:0] <= {mem_rdata[31],
+								                              mem_rdata == 32'd0, 2'b00};
+							endcase
+						end
+						if (p_dreg[3])
+							rfw(p_dreg, move_v);
+						else
+							rfw(p_dreg, merge_sz(rf_rdata_b, move_v, op_size));
+						fetch_next;
+					end
+					else if (r_m_ret == S_PIPE_SDONE && p_dst == DK_REG) begin
 						src_val <= mem_rdata;
 						dst_val <= rf_rdata_b;
 						state <= S_EXEC;
