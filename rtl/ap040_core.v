@@ -1861,36 +1861,20 @@ endtask
 
 // A taken DBcc is the hot branch-refill consumer: the focused loop accounts
 // for every direct refill dispatch from S_DBCC1.  When its complete target
-// window is already resident, consume the first opcode here and seed only the
-// three still-live queue slots.  Keeping this out of generic go_pc avoids
-// widening every redirect path with the branch-buffer read mux.
+// window is already resident, let the ordinary refill path seed the queue and
+// consume its first opcode here.  Keeping this out of generic go_pc avoids
+// widening every redirect path with the branch-buffer read mux, while reusing
+// issue_ifetch avoids a second set of wide branch-buffer-to-queue writers.
 task decode_dbcc_brf;
 	input [31:0] a;
 	reg  [15:0] fw;
 	begin
-		if (a[1]) begin
-			fw = brf_data[a[4:2]][15:0];
-			epf_data[1] <= brf_data[a[4:2] + 3'd1][31:16];
-			epf_data[2] <= brf_data[a[4:2] + 3'd1][15:0];
-			epf_data[3] <= brf_data[a[4:2] + 3'd2][31:16];
-		end
-		else begin
-			fw = brf_data[a[4:2]][31:16];
-			epf_data[1] <= brf_data[a[4:2]][15:0];
-			epf_data[2] <= brf_data[a[4:2] + 3'd1][31:16];
-			epf_data[3] <= brf_data[a[4:2] + 3'd1][15:0];
-		end
+		fw = a[1] ? brf_data[a[4:2]][15:0]
+		          : brf_data[a[4:2]][31:16];
+		issue_ifetch(a, sr_s);
 		epf_head  <= 3'd1;
 		epf_count <= 4'd3;
-		epf_fill  <= 3'd4;
 		epf_next  <= a + 32'd2;
-		epf_ftail <= a + 32'd8;
-		epf_super <= sr_s;
-		epf_armed <= 1;
-		epf_err   <= 0;
-		epf_brf   <= 1;
-		epf_kill  <= 0;
-		epf_flushed = 1;
 		epf_issue = 1;
 
 		in_exc <= 0;
@@ -3311,7 +3295,8 @@ always @(posedge clk) begin
 						// The generic redirect keeps trace/interrupt priority.
 						// Only the ordinary idle-bus loop case dispatches here.
 						if (!tr_t1 && !tr_t0 && !irq_pend && refill_hit &&
-						    !epf_pend && !mem_req && !mem_ack)
+						    !epf_pend && !mem_req && !mem_ack &&
+						    (!epf_armed || epf_next != tgt || epf_super != sr_s))
 							decode_dbcc_brf(tgt);
 						else
 							go_pc(tgt);
