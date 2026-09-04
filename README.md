@@ -114,6 +114,15 @@ simulation-only cycle win is not sufficient: one broader register-register
 retirement experiment passed simulation and timing but froze during Mac OS
 startup, so it remains rejected.
 
+The current front end retires a resident queued opcode directly into decode
+and, when bus ownership is unambiguous, consumes resident immediate extension
+words from decode without an otherwise empty `S_IMMF` cycle. The immediate
+step is deliberately limited to `S_DECODE`, refuses an outstanding prefetch or
+same-edge memory acknowledgement, and suppresses a new speculative fill while
+it pops the queue. On Wombat33 it removes 6.79% from the focused loop and 0.285%
+from the first 100 differential rows; the complete standalone suite and
+hardware Speedometer run pass.
+
 In the Wombat33 seed-27 fit at commit `2b3634d`, the complete CPU hierarchy
 accounts for about 24,783 ALMs; `ap040_core` accounts for about 23,565, of
 which about 15,947 are the core's own sequencer/decode logic. The complete
