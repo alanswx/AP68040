@@ -339,10 +339,12 @@ t0flow:
 t27ok:
 
 ;----------------------------------------------------------------- MOVE USP
-	movea.l	#$3C00,a0
+	movea.l	#$3D40,a0	; differ from USP value left by MOVEC test above
+	move.l	#100,d0
+	divu.w	#3,d0		; let the fetch queue get ahead of decode
 	move	a0,usp
 	move	usp,a1
-	cmpa.l	#$3C00,a1
+	cmpa.l	#$3D40,a1
 	beq.s	t28ok
 	failt	28
 t28ok:
@@ -695,7 +697,10 @@ irq_withdraw_loop:
 	; request to arrive inside the MOVE to SR that masks it.
 	move.w	#$2000,sr		; mask 0 while the request arrives
 	move.w	(cnt_int2).l,d5
-	move.w	#6,(IPLDLY).l
+	; Five cycles lands inside MOVE-to-SR even when a resident next opcode is
+	; consumed at the preceding retirement boundary (one cycle earlier than
+	; the standalone S_FETCH path).
+	move.w	#5,(IPLDLY).l
 	move.w	#$2700,sr		; request qualifies inside this insn
 	nop
 	nop

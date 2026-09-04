@@ -857,6 +857,29 @@ smcq_ok:
 	move.l	#$80008000,d0
 	movec	d0,cacr		; cache-hot again
 
+;----------------------------------- retirement forwarding into short BSR
+; A register-file write requested by the retiring instruction commits in the
+; register-file block on the following edge.  A front end which dispatches the
+; next resident opcode without S_FETCH must therefore forward a just-written A7
+; to BSR.B, whose decode starts the stack push directly from dbg_a7.
+	move.l	a7,a5
+	lea	($3300).l,a0
+	move.l	#bsr_stale_fail,($32FC).l
+				; a wrong-stack return lands on an explicit failure
+	move.l	#100,d0
+	divu.w	#3,d0		; give the fetch queue time to run ahead
+	nop
+	nop
+	nop
+	nop
+	move.l	a0,a7
+	bsr.s	bsr_after_a7_write
+	cmp.l	#$3300,a7
+	beq.s	bsr_a7_forward_ok
+	failt	193
+bsr_a7_forward_ok:
+	move.l	a5,a7
+
 ;----------------------------------------------------------------- all done
 	move.w	#$600D,(DONEREG).l
 	stop	#$2700
@@ -868,6 +891,12 @@ sub1:
 
 subrtd:
 	rtd	#4
+
+bsr_after_a7_write:
+	rts
+
+bsr_stale_fail:
+	failt	193
 
 fail_all:
 	move.w	d7,(FAILREG).l

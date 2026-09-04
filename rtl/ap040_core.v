@@ -260,6 +260,15 @@ reg  [31:0] aux_wdata;
 wire [31:0] usp_q, isp_q, msp_q;
 wire [31:0] dbg_d0, dbg_d1, dbg_d2, dbg_a0, dbg_a7;
 
+// rfw/aux writes cross into the register-file block on the following clock
+// edge.  Most decoded instructions select an asynchronous read port and do
+// not consume it until a later state, but BSR.B and MOVE USP,An use these
+// direct views in decode.  When fetch_next dispatches a resident opcode
+// without the old S_FETCH bubble, forward the write which is committing on
+// this edge so those two consumers see architectural retirement order.
+wire [31:0] dbg_a7_wb = (rf_we && rf_waddr == 4'd15) ? rf_wdata : dbg_a7;
+wire [31:0] usp_wb = (aux_we && aux_sel == 2'd0) ? aux_wdata : usp_q;
+
 ap040_regfile regfile
 (
 	.clk(clk), .ce(ce), .nreset(nreset),
@@ -1764,6 +1773,29 @@ task fetch_next;
 			// Instruction writeback is registered separately.  Do not let
 			// S_EXC0 sample Dn/An/A7 on the same edge that commits it.
 			state <= S_POST_EXC_F2;
+		end
+		// The boundary checks above are the only architectural work between a
+		// completed instruction and consumption of an already-resident opcode.
+		// Retire directly into decode when the queue has that word, instead of
+		// spending a separate S_FETCH cycle to perform the same pop/defaults.
+		// A flush issued earlier in this clock (CINV/PFLUSH/MOVEC or a
+		// self-modifying store) wins even though epf_armed changes through a
+		// nonblocking assignment and still appears live here.
+		else if (epf_ready_pc && !epf_flushed) begin
+			in_exc <= 0;
+			epf_pop = 2'd1;
+			ir <= epf_data[epf_head];
+			pc_i <= pc;
+			pc <= pc + 32'd2;
+			tr_t1 <= sr[15];
+			tr_t0 <= sr[14];
+			flow_t0_pend <= 0;
+			t0_force <= t0_special(epf_data[epf_head]);
+			p_src <= SK_NONE; p_dst <= DK_NONE;
+			p_rmw <= 0; p_wbsup <= 0; p_flags <= 1; p_sextw <= 0;
+			p_dst_mem_bit <= 0;
+			exec_kind <= EK_ALU;
+			state <= S_DECODE;
 		end
 		else begin
 			issue_ifetch(pc, sr_s);
@@ -5513,7 +5545,7 @@ always @(posedge clk) begin
 										end
 										6'b101???: begin // MOVE USP,An
 											if (!sr_s) go_priv;
-											else begin rfw({1'b1, d_rn}, usp_q); fetch_next; end
+											else begin rfw({1'b1, d_rn}, usp_wb); fetch_next; end
 										end
 										6'b110000: begin // RESET
 											if (!sr_s) go_priv;
@@ -5631,7 +5663,7 @@ always @(posedge clk) begin
 							if (bt[0]) go_pc(bt);
 							else begin
 								br_tgt <= bt;
-								mwr(dbg_a7 - 32'd4, `AP040_SZ_L, pc, S_BSR_PUSH);
+								mwr(dbg_a7_wb - 32'd4, `AP040_SZ_L, pc, S_BSR_PUSH);
 							end
 						end
 						else finish_bcc(pc + sxb(ir[7:0]), cond_true(ir[11:8]));
