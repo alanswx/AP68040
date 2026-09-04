@@ -5849,7 +5849,15 @@ always @(posedge clk) begin
 							p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
 							if (d_mode == 3'b001 && std_size == `AP040_SZ_B) go_illegal;
 							else if (d_mode == 3'b000 || d_mode == 3'b001) begin
-								p_src <= SK_REG; p_sreg <= {d_mode[0], d_rn}; pipe_go;
+								p_src <= SK_REG; p_sreg <= {d_mode[0], d_rn};
+								// CMP.L Dn,Dn needs no immediate or EA setup. Select
+								// both register-file ports in decode and skip PIPE_START.
+								if (d_mode == 3'b000 && std_size == `AP040_SZ_L) begin
+									rr_a <= {1'b0, d_rn};
+									rr_b <= {1'b0, d_reg9};
+									state <= S_PIPE_REGS;
+								end
+								else pipe_go;
 							end
 							else if (ea_is_imm) begin p_src <= SK_IMM; immf((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START); end
 							else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
