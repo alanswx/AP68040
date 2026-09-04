@@ -1859,10 +1859,70 @@ task go_priv;
 	end
 endtask
 
+// A control-flow redirect whose target is already complete in the branch
+// refill sector does not need to spend an S_FETCH cycle copying that first
+// word into IR.  Seed the three following words into the execution queue and
+// perform the ordinary opcode-dispatch bookkeeping here.  Callers must first
+// prove that neither an old fetch nor a completing memory cycle owns the port.
+task decode_brf;
+	input [31:0] a;
+	input        s;
+	reg  [15:0] fw;
+	begin
+		if (a[1]) begin
+			fw = brf_data[a[4:2]][15:0];
+			epf_data[0] <= brf_data[a[4:2]][15:0];
+			epf_data[1] <= brf_data[a[4:2] + 3'd1][31:16];
+			epf_data[2] <= brf_data[a[4:2] + 3'd1][15:0];
+			epf_data[3] <= brf_data[a[4:2] + 3'd2][31:16];
+		end
+		else begin
+			fw = brf_data[a[4:2]][31:16];
+			epf_data[0] <= brf_data[a[4:2]][31:16];
+			epf_data[1] <= brf_data[a[4:2]][15:0];
+			epf_data[2] <= brf_data[a[4:2] + 3'd1][31:16];
+			epf_data[3] <= brf_data[a[4:2] + 3'd1][15:0];
+		end
+		epf_head  <= 3'd1;
+		epf_count <= 4'd3;
+		epf_fill  <= 3'd4;
+		epf_next  <= a + 32'd2;
+		epf_ftail <= a + 32'd8;
+		epf_super <= s;
+		epf_armed <= 1;
+		epf_err   <= 0;
+		epf_brf   <= 1;
+		epf_kill  <= 0;
+		epf_flushed = 1;
+		epf_issue = 1;
+
+		in_exc <= 0;
+		ir <= fw;
+		pc_i <= a;
+		pc <= a + 32'd2;
+		tr_t1 <= sr[15];
+		tr_t0 <= sr[14];
+		flow_t0_pend <= 0;
+		t0_force <= t0_special(fw);
+		p_src <= SK_NONE; p_dst <= DK_NONE;
+		p_rmw <= 0; p_wbsup <= 0; p_flags <= 1; p_sextw <= 0;
+		p_dst_mem_bit <= 0;
+		exec_kind <= EK_ALU;
+		fc_ovr_v <= 0;
+		state <= S_DECODE;
+	end
+endtask
+
 // jump to a control flow target with odd address check
 task go_pc;
 	input [31:0] t;
+	reg refill_hit;
 	begin
+		refill_hit = brf_tag == t[31:5] && brf_super == sr_s &&
+		             t[4:1] <= 4'd12 && brf_valid[t[4:1]] &&
+		             brf_valid[t[4:1] + 4'd1] &&
+		             brf_valid[t[4:1] + 4'd2] &&
+		             brf_valid[t[4:1] + 4'd3];
 		// The format-$2 address field contains the referenced address with A0
 		// cleared, not the raw odd target.
 		if (t[0]) exc(`AP040_VEC_ADDRERR, 4'd2, pc_i, {t[31:1], 1'b0});
@@ -1917,6 +1977,8 @@ task go_pc;
 				epf_flush;
 				state <= S_POST_EXC;
 			end
+			else if (refill_hit && !epf_pend && !mem_req && !mem_ack)
+				decode_brf(t, sr_s);
 			else begin
 				issue_ifetch(t, sr_s);
 				pc_i <= t;

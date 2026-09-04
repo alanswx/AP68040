@@ -879,6 +879,37 @@ smcq_ok:
 	failt	193
 bsr_a7_forward_ok:
 	move.l	a5,a7
+	bra.s	brf_rts_test
+bsr_after_a7_write:
+	rts
+
+;------------------------- branch-refill dispatch after RTS writeback
+; A refill-buffer hit can now dispatch the return target without S_FETCH.
+; RTS requests its A7 update on the same edge as that redirect, so make the
+; first target opcode another short BSR and verify that it pushes through the
+; forwarded, post-RTS stack pointer.  The divide gives the queue time to fill
+; the aligned target sector before the first call redirects within it.
+brf_rts_test:
+	move.l	a7,a5
+	lea	($3340).l,a0
+	move.l	#brf_rts_stale_fail,($3338).l
+	move.l	#brf_rts_stale_fail,($333C).l
+	move.l	a0,a7
+	cnop	0,32
+	move.l	#100,d0
+	divu.w	#3,d0
+	bsr.s	brf_rts_seed
+brf_rts_target:
+	bsr.s	brf_rts_leaf
+	cmp.l	a0,a7
+	beq.s	brf_rts_forward_ok
+	failt	194
+brf_rts_seed:
+	rts
+brf_rts_leaf:
+	rts
+brf_rts_forward_ok:
+	move.l	a5,a7
 
 ;----------------------------------------------------------------- all done
 	move.w	#$600D,(DONEREG).l
@@ -892,11 +923,11 @@ sub1:
 subrtd:
 	rtd	#4
 
-bsr_after_a7_write:
-	rts
-
 bsr_stale_fail:
 	failt	193
+
+brf_rts_stale_fail:
+	failt	194
 
 fail_all:
 	move.w	d7,(FAILREG).l

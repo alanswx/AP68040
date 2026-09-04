@@ -642,6 +642,9 @@ always @(posedge clk) if (nreset && mem_ready && busstate == 2'b11 &&
 integer prof_cnt [0:255];
 integer prof_stall [0:255];
 integer prof_on = 0;
+integer prof_fetch_brf = 0;     // S_FETCH cycles consuming a branch-refill seed
+integer prof_inline_brf = 0;    // refill target dispatched without S_FETCH
+reg [7:0] prof_prev_state = 0;
 
 // +memlat: request-to-acknowledge latency for the core's memory port,
 // split by operation class.  S_MRD costs ~7.6 cycles on a CACHED load
@@ -707,6 +710,13 @@ always @(posedge clk) if (prof_on && nreset) begin
 	prof_cnt[dut.core.state] = prof_cnt[dut.core.state] + 1;
 	if (!clkena_in)
 		prof_stall[dut.core.state] = prof_stall[dut.core.state] + 1;
+	if (dut.core.state == 8'd3 && dut.core.epf_brf)
+		prof_fetch_brf = prof_fetch_brf + 1;
+	if (dut.core.state == 8'd4 && dut.core.epf_brf &&
+	    dut.core.epf_head == 3'd1 && dut.core.epf_count == 4'd3 &&
+	    prof_prev_state != 8'd3)
+		prof_inline_brf = prof_inline_brf + 1;
+	prof_prev_state <= dut.core.state;
 end
 
 task memlat_dump;
@@ -750,6 +760,10 @@ task prof_dump;
 		fetch_immf = prof_cnt[8'd3] + prof_cnt[8'd8];
 		$display("PROF   S_FETCH+S_IMMF occupancy: %0d / %0d = %0d%%",
 		         fetch_immf, total, (fetch_immf * 100) / total);
+		$display("PROF   branch-refill S_FETCH occupancy: %0d", prof_fetch_brf);
+		$display("PROF   inline branch-refill dispatches: %0d", prof_inline_brf);
+		prof_fetch_brf = 0;
+		prof_inline_brf = 0;
 		for (pi = 0; pi < 256; pi = pi + 1) begin
 			prof_cnt[pi] = 0;
 			prof_stall[pi] = 0;
