@@ -1859,6 +1859,57 @@ task go_priv;
 	end
 endtask
 
+// A taken DBcc is the hot branch-refill consumer: the focused loop accounts
+// for every direct refill dispatch from S_DBCC1.  When its complete target
+// window is already resident, consume the first opcode here and seed only the
+// three still-live queue slots.  Keeping this out of generic go_pc avoids
+// widening every redirect path with the branch-buffer read mux.
+task decode_dbcc_brf;
+	input [31:0] a;
+	reg  [15:0] fw;
+	begin
+		if (a[1]) begin
+			fw = brf_data[a[4:2]][15:0];
+			epf_data[1] <= brf_data[a[4:2] + 3'd1][31:16];
+			epf_data[2] <= brf_data[a[4:2] + 3'd1][15:0];
+			epf_data[3] <= brf_data[a[4:2] + 3'd2][31:16];
+		end
+		else begin
+			fw = brf_data[a[4:2]][31:16];
+			epf_data[1] <= brf_data[a[4:2]][15:0];
+			epf_data[2] <= brf_data[a[4:2] + 3'd1][31:16];
+			epf_data[3] <= brf_data[a[4:2] + 3'd1][15:0];
+		end
+		epf_head  <= 3'd1;
+		epf_count <= 4'd3;
+		epf_fill  <= 3'd4;
+		epf_next  <= a + 32'd2;
+		epf_ftail <= a + 32'd8;
+		epf_super <= sr_s;
+		epf_armed <= 1;
+		epf_err   <= 0;
+		epf_brf   <= 1;
+		epf_kill  <= 0;
+		epf_flushed = 1;
+		epf_issue = 1;
+
+		in_exc <= 0;
+		ir <= fw;
+		pc_i <= a;
+		pc <= a + 32'd2;
+		tr_t1 <= sr[15];
+		tr_t0 <= sr[14];
+		flow_t0_pend <= 0;
+		t0_force <= t0_special(fw);
+		p_src <= SK_NONE; p_dst <= DK_NONE;
+		p_rmw <= 0; p_wbsup <= 0; p_flags <= 1; p_sextw <= 0;
+		p_dst_mem_bit <= 0;
+		exec_kind <= EK_ALU;
+		fc_ovr_v <= 0;
+		state <= S_DECODE;
+	end
+endtask
+
 // jump to a control flow target with odd address check
 task go_pc;
 	input [31:0] t;
@@ -3240,7 +3291,13 @@ always @(posedge clk) begin
 				// loop exits without branching (cputest 68040_ae DBcc.W).
 				reg [31:0] tgt;
 				reg [15:0] w;
+				reg refill_hit;
 				tgt = br_base + sxw(imm[15:0]);
+				refill_hit = brf_tag == tgt[31:5] && brf_super == sr_s &&
+				             tgt[4:1] <= 4'd12 && brf_valid[tgt[4:1]] &&
+				             brf_valid[tgt[4:1] + 4'd1] &&
+				             brf_valid[tgt[4:1] + 4'd2] &&
+				             brf_valid[tgt[4:1] + 4'd3];
 				if (tgt[0]) go_pc(tgt);
 				else if (cond_true(ir[11:8])) fetch_next;
 				else begin
@@ -3250,7 +3307,15 @@ always @(posedge clk) begin
 					// interrupt barrier preserves this same-edge writeback.
 					w = rf_rdata_a[15:0] - 16'd1;
 					rfw({1'b0, d_rn}, {rf_rdata_a[31:16], w});
-					if (w != 16'hFFFF) go_pc(tgt);
+					if (w != 16'hFFFF) begin
+						// The generic redirect keeps trace/interrupt priority.
+						// Only the ordinary idle-bus loop case dispatches here.
+						if (!tr_t1 && !tr_t0 && !irq_pend && refill_hit &&
+						    !epf_pend && !mem_req && !mem_ack)
+							decode_dbcc_brf(tgt);
+						else
+							go_pc(tgt);
+					end
 					else fetch_next;
 				end
 			end
