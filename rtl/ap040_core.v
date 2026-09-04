@@ -1504,7 +1504,36 @@ task immf;
 	input [7:0] ret;
 	begin
 		imm_n <= n; imm <= 0;
-		r_imm_ret <= ret; state <= S_IMMF;
+		r_imm_ret <= ret;
+		// Decode commonly asks for an extension word which the prefetch queue
+		// already holds.  Consume it here instead of entering S_IMMF merely to
+		// perform the same pop on the following edge.  Keep later-state callers
+		// on the established path: some build multi-part EA/FPU operands around
+		// this task and need their current state transition as a boundary.
+		//
+		// Do not cross an instruction-bus completion or an outstanding queue
+		// fill.  Some return states can quickly start a data/MMU transaction;
+		// advancing them while the old fetch still owns the physical bus lets
+		// the table walker overlap that bus.  epf_issue also suppresses a new
+		// speculative fill on this same edge, preserving that ownership rule.
+		if (state == S_DECODE && !epf_flushed && !epf_pend && !mem_ack &&
+		    n == 2'd2 && epf_ready_pc2) begin
+			imm <= {epf_data[epf_head], epf_data[epf_head + 3'd1]};
+			pc <= pc + 32'd4;
+			epf_pop = 2'd2;
+			epf_issue = 1;
+			state <= ret;
+		end
+		else if (state == S_DECODE && !epf_flushed && !epf_pend && !mem_ack &&
+		         epf_ready_pc) begin
+			imm <= {16'd0, epf_data[epf_head]};
+			pc <= pc + 32'd2;
+			epf_pop = 2'd1;
+			epf_issue = 1;
+			if (n == 2'd1) state <= ret;
+			else begin imm_n <= 2'd1; state <= S_IMMF; end
+		end
+		else state <= S_IMMF;
 	end
 endtask
 
