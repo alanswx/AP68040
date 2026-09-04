@@ -644,6 +644,7 @@ integer prof_stall [0:255];
 integer prof_on = 0;
 integer prof_fetch_brf = 0;     // S_FETCH cycles consuming a branch-refill seed
 integer prof_inline_brf = 0;    // refill target dispatched without S_FETCH
+integer prof_inline_brf_from [0:255];
 reg [7:0] prof_prev_state = 0;
 
 // +memlat: request-to-acknowledge latency for the core's memory port,
@@ -678,6 +679,7 @@ initial begin
 	for (pi = 0; pi < 256; pi = pi + 1) begin
 		prof_cnt[pi] = 0;
 		prof_stall[pi] = 0;
+		prof_inline_brf_from[pi] = 0;
 	end
 end
 always @(posedge clk) if (memlat_on && nreset) begin
@@ -714,8 +716,11 @@ always @(posedge clk) if (prof_on && nreset) begin
 		prof_fetch_brf = prof_fetch_brf + 1;
 	if (dut.core.state == 8'd4 && dut.core.epf_brf &&
 	    dut.core.epf_head == 3'd1 && dut.core.epf_count == 4'd3 &&
-	    prof_prev_state != 8'd3)
+	    prof_prev_state != 8'd3) begin
 		prof_inline_brf = prof_inline_brf + 1;
+		prof_inline_brf_from[prof_prev_state] =
+			prof_inline_brf_from[prof_prev_state] + 1;
+	end
 	prof_prev_state <= dut.core.state;
 end
 
@@ -762,11 +767,16 @@ task prof_dump;
 		         fetch_immf, total, (fetch_immf * 100) / total);
 		$display("PROF   branch-refill S_FETCH occupancy: %0d", prof_fetch_brf);
 		$display("PROF   inline branch-refill dispatches: %0d", prof_inline_brf);
+		for (pi = 0; pi < 256; pi = pi + 1)
+			if (prof_inline_brf_from[pi] != 0)
+				$display("PROF     from state %0d: %0d",
+				         pi, prof_inline_brf_from[pi]);
 		prof_fetch_brf = 0;
 		prof_inline_brf = 0;
 		for (pi = 0; pi < 256; pi = pi + 1) begin
 			prof_cnt[pi] = 0;
 			prof_stall[pi] = 0;
+			prof_inline_brf_from[pi] = 0;
 		end
 	end
 endtask
