@@ -211,6 +211,20 @@ reg         ack_r;
 reg  [31:0] rdata_r;
 reg         pass_store_chk;      // C_PASS owns an aligned store tag lookup
 
+// One-longword sequential instruction lookahead.  A normal I-cache hit has
+// already identified the resident way and leaves the data RAM otherwise idle
+// while its registered acknowledge is returned.  Use that cycle to read the
+// next longword in the same 16-byte line, then retain it in this small buffer.
+// If the very next accepted cache request is for that physical longword it can
+// be acknowledged directly from C_IDLE, without another synchronous tag/data
+// lookup.  The buffer is strictly a cache-hit latency optimization: it neither
+// advances architectural PC nor creates a new memory request.
+reg         ipred_pending;
+reg         ipred_valid;
+reg   [1:0] ipred_way;
+reg  [29:0] ipred_addr;          // aligned physical address [31:2]
+reg  [31:0] ipred_data;
+
 wire [21:0] t_w0 = tag_q[21:0];
 wire [21:0] t_w1 = tag_q[43:22];
 wire [21:0] t_w2 = tag_q[65:44];
@@ -430,8 +444,32 @@ wire [31:0] data_hit = (hit_way == 2'd0) ? data_q0 :
                        (hit_way == 2'd1) ? data_q1 :
                        (hit_way == 2'd2) ? data_q2 : data_q3;
 
-assign cd_rd_en  = rd_accept || store_lookup_accept; // issued with tag lookup
-assign cd_ridx   = {c_instr, a_set, c_addr[3:2]};
+// The prediction is one-shot on the instruction side.  An intervening DATA
+// request cannot displace an instruction-cache line (the banks have separate
+// tag rows), and ipred_data is a private copy, so normal loads/stores may pass
+// without killing it.  A nonmatching instruction request clears it, which
+// proves that its source line cannot have been displaced between creation and
+// use.  CINV/reset clear it separately below.
+wire ipred_hit = (cst == C_IDLE) && c_req && !ack_r && !c_write && c_instr &&
+                 ie && !c_nocache && fits_long && !ci_inv_pend &&
+                 !(cinv_req && !cinv_done) && ipred_valid &&
+                 (c_addr[31:2] == ipred_addr);
+
+// A regular instruction hit seeds the first lookahead.  A lookahead hit can
+// chain to the following word.  Never cross a cache-line boundary: the next
+// line needs its own tag lookup even when its data happens to occupy the same
+// way.
+wire ipred_seed_read = (cst == C_LOOK) && look_hit && r_bank &&
+                       (r_addr[3:2] != 2'd3);
+wire ipred_chain_read = ipred_hit && (c_addr[3:2] != 2'd3);
+wire ipred_read = ipred_seed_read || ipred_chain_read;
+wire [5:0] ipred_read_set = ipred_seed_read ? r_row[5:0] : c_addr[9:4];
+wire [1:0] ipred_read_word = ipred_seed_read
+	? (r_addr[3:2] + 2'd1) : (c_addr[3:2] + 2'd1);
+
+assign cd_rd_en  = rd_accept || store_lookup_accept || ipred_read;
+assign cd_ridx   = ipred_read ? {1'b1, ipred_read_set, ipred_read_word}
+                              : {c_instr, a_set, c_addr[3:2]};
 wire store_hit_write = (cst == C_PASS) && pass_store_chk && m_ack && look_hit;
 assign cd_we     = store_hit_write
 	                  ? (4'd1 << hit_way) :
@@ -462,12 +500,27 @@ always @(posedge clk) begin
 		r_row <= 0; r_tag <= 0; r_word <= 0; r_way <= 0; r_bank <= 0;
 		r_beat <= 0; r_issued <= 0; r_addr <= 0; r_size <= 0; r_off <= 0;
 		fill_hold <= 0; r_wdata <= 0; pass_store_chk <= 0;
+		ipred_pending <= 0; ipred_valid <= 0; ipred_way <= 0;
+		ipred_addr <= 0; ipred_data <= 0;
 		ack_r <= 0; rdata_r <= 0;
 	end
 	else if (ce) begin
 		ack_r <= 0;
 		cinv_done <= 0;
 		if (ci_inv) ci_inv_pend <= 0;
+
+		// The lookahead RAM read completed on the preceding edge.  Capture the
+		// selected way before any newly accepted request can reuse the RAM port.
+		if (ipred_pending) begin
+			case (ipred_way)
+				2'd0: ipred_data <= data_q0;
+				2'd1: ipred_data <= data_q1;
+				2'd2: ipred_data <= data_q2;
+				default: ipred_data <= data_q3;
+			endcase
+			ipred_pending <= 0;
+			ipred_valid <= 1;
+		end
 
 		// A snoop displaced a store's first-set invalidate in its
 		// acceptance cycle: remember it and issue it as soon as port B
@@ -488,9 +541,23 @@ always @(posedge clk) begin
 			C_IDLE: begin
 				if (!c_req) err_hold <= 0;
 				if (cinv_req && !cinv_done) begin
+					ipred_pending <= 0;
+					ipred_valid <= 0;
 					sweep_cnt <= 0;
 					sweep_all <= 0;   // honour the cinv_ic/cinv_dc selects
 					cst <= C_SWEEP;
+				end
+				else if (ipred_hit) begin
+					// Registered completion just like C_LOOK, but the word was
+					// read ahead while the previous hit acknowledged.
+					rdata_r <= lw_extract(ipred_data, c_size, c_addr[1:0]);
+					ack_r <= 1;
+					ipred_valid <= 0;
+					if (c_addr[3:2] != 2'd3) begin
+						ipred_pending <= 1;
+						ipred_addr <= c_addr[31:2] + 30'd1;
+						// ipred_way remains the known resident way.
+					end
 				end
 				// A cache-inhibited hit owes a row invalidate.  Accept
 				// NOTHING until it lands.  rd_accept alone gated only the
@@ -523,6 +590,13 @@ always @(posedge clk) begin
 				// lose its invalidate.  The cost is nil in practice.
 				else if (c_req && !ack_r && !err_hold &&
 				         (c_write || !ci_inv_pend)) begin
+					// A nonmatching instruction access makes the one-shot
+					// prediction unreachable.  Data traffic uses the independent
+					// D-cache bank and may safely pass between sequential fills.
+					if (c_instr) begin
+						ipred_pending <= 0;
+						ipred_valid <= 0;
+					end
 					if (c_write) begin
 						if (store_inv_lost) begin
 							// port B owes a recorded invalidate: hold the
@@ -640,6 +714,12 @@ always @(posedge clk) begin
 					// hit completes here: two cycles request-to-ack
 					rdata_r <= lw_extract(data_hit, r_size, r_off);
 					ack_r <= 1;
+					if (r_bank && r_addr[3:2] != 2'd3) begin
+						ipred_pending <= 1;
+						ipred_valid <= 0;
+						ipred_way <= hit_way;
+						ipred_addr <= r_addr[31:2] + 30'd1;
+					end
 					cst <= C_IDLE;
 				end
 				else begin

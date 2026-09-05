@@ -29,6 +29,9 @@
 //             and leave the completed line hitting without more bus traffic.
 //   T11       an aligned write-through hit updates only its matching cached
 //             longword and preserves all other ways in the same set.
+//   T12       a sequential instruction hit reads the following longword ahead,
+//             serves it one cycle faster (including a word at offset two),
+//             chains within the line, and survives intervening D-cache traffic.
 //
 // Every test reprograms memory behind the cache and requires the next
 // read to return the NEW value: a stale cached longword is the failure
@@ -169,6 +172,32 @@ task cpu_read;
 			errors = errors + 1;
 		end
 		d = c_rdata;
+		@(negedge clk);
+		c_req = 0;
+		@(posedge clk);
+	end
+endtask
+
+task cpu_read_count_sized;
+	input  [31:0] a;
+	input   [1:0] sz;
+	output [31:0] d;
+	output integer cycles;
+	integer guard;
+	begin
+		@(negedge clk);
+		c_req = 1; c_write = 0; c_size = sz; c_addr = a;
+		guard = 0;
+		while (!(c_ack && ce) && guard < 200) begin
+			@(posedge clk);
+			guard = guard + 1;
+		end
+		if (guard >= 200) begin
+			$display("FAIL: counted read timeout at %h", a);
+			errors = errors + 1;
+		end
+		d = c_rdata;
+		cycles = guard;
 		@(negedge clk);
 		c_req = 0;
 		@(posedge clk);
@@ -373,6 +402,10 @@ integer i, off;
 integer guard5;
 integer line_base;
 integer line_guard;
+integer fill_cycles;
+integer normal_cycles;
+integer fast_cycles;
+integer fast2_cycles;
 reg [31:0] d;
 reg [31:0] d2;
 
@@ -780,6 +813,61 @@ initial begin
 		         mread_count - line_base);
 		errors = errors + 1;
 	end
+
+	//------------------------------------------------------------------
+	// T12: a normal instruction hit pre-reads the next longword.  The
+	// predicted request must complete faster without issuing memory traffic;
+	// a word request at offset two still extracts the correct big-endian lane.
+	// D-cache traffic between predicted instruction words is safe because the
+	// cache banks have independent tags and the predictor owns a data copy.
+	//------------------------------------------------------------------
+	cinv_req = 1; cinv_ic = 1; cinv_dc = 1;
+	@(negedge clk);
+	while (!cinv_done) @(posedge clk);
+	cinv_req = 0;
+	repeat (4) @(posedge clk);
+
+	mem[32'hF000>>2] = 32'h1234_5678;
+	mem[32'hF004>>2] = 32'h89AB_CDEF;
+	mem[32'hF008>>2] = 32'h0BAD_F00D;
+	mem[32'hF00C>>2] = 32'hCAFE_BABE;
+	c_instr = 1;
+	line_base = mread_count;
+	cpu_read_count_sized(32'h0000_F000, 2'b10, d, fill_cycles);   // fill
+	cpu_read_count_sized(32'h0000_F000, 2'b10, d, normal_cycles); // seed
+	cpu_read_count_sized(32'h0000_F006, 2'b01, d, fast_cycles);   // use/chain
+	if (d !== 32'h0000_CDEF) begin
+		$display("FAIL test 12: predicted word read got %h expected 0000CDEF", d);
+		errors = errors + 1;
+	end
+	cpu_read_count_sized(32'h0000_F008, 2'b10, d, fast2_cycles);  // use/chain
+	if (d !== 32'h0BAD_F00D) begin
+		$display("FAIL test 12: chained long read got %h expected 0BADF00D", d);
+		errors = errors + 1;
+	end
+	if (fast_cycles >= normal_cycles || fast2_cycles >= normal_cycles) begin
+		$display("FAIL test 12: lookahead latency normal=%0d fast=%0d chained=%0d",
+		         normal_cycles, fast_cycles, fast2_cycles);
+		errors = errors + 1;
+	end
+
+	// An unrelated data hit may overwrite the RAM outputs, but not the
+	// predictor's private copy of F00C.
+	c_instr = 0;
+	expect_read(32'h0000_1000, 32'h1111_A001, 12);
+	c_instr = 1;
+	cpu_read_count_sized(32'h0000_F00C, 2'b10, d, fast_cycles);
+	if (d !== 32'hCAFE_BABE || fast_cycles >= normal_cycles) begin
+		$display("FAIL test 12: prediction across data traffic got %h in %0d cycles (normal %0d)",
+		         d, fast_cycles, normal_cycles);
+		errors = errors + 1;
+	end
+	if ((mread_count - line_base) != 8) begin
+		$display("FAIL test 12: instruction plus intervening data fills used %0d memory beats, expected 8",
+		         mread_count - line_base);
+		errors = errors + 1;
+	end
+	c_instr = 0;
 
 	if (errors == 0) $display("ALL TESTS PASSED");
 	else $display("TEST FAILED with %0d errors", errors);
