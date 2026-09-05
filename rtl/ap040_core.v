@@ -1824,13 +1824,44 @@ task fetch_next;
 			p_rmw <= 0; p_wbsup <= 0; p_flags <= 1; p_sextw <= 0;
 			p_dst_mem_bit <= 0;
 			exec_kind <= EK_ALU;
-			state <= S_DECODE;
+			if (is_addl_dd(epf_data[epf_head]))
+				start_addl_dd(epf_data[epf_head]);
+			else
+				state <= S_DECODE;
 		end
 		else begin
 			issue_ifetch(pc, sr_s);
 			pc_i <= pc;
 			state <= S_FETCH;
 		end
+	end
+endtask
+
+// The first one-entry predecode proof is deliberately one exact, measured
+// form.  It needs no extension word, EA, privilege decision, or special
+// engine, and accounts for 12,800 focused-loop decodes per phase.
+function is_addl_dd;
+	input [15:0] op;
+	begin
+		is_addl_dd = op[15:12] == 4'hD && !op[8] &&
+		               op[7:6] == `AP040_SZ_L && op[5:3] == 3'b000;
+	end
+endfunction
+
+task start_addl_dd;
+	input [15:0] op;
+	begin
+		alu_op <= `AP040_ALU_ADD;
+		op_size <= `AP040_SZ_L;
+		p_ssize <= `AP040_SZ_L;
+		p_dsize <= `AP040_SZ_L;
+		p_src <= SK_REG;
+		p_sreg <= {1'b0, op[2:0]};
+		p_dst <= DK_REG;
+		p_dreg <= {1'b0, op[11:9]};
+		rr_a <= {1'b0, op[2:0]};
+		rr_b <= {1'b0, op[11:9]};
+		state <= S_PIPE_REGS;
 	end
 endtask
 
@@ -2680,11 +2711,20 @@ always @(posedge clk) begin
 
 			// Both operands captured together.  src_val is taken only for a
 			// REGISTER source: an immediate source was latched in
-			// S_PIPE_START and a sourceless op never reads it.
+			// S_PIPE_START and a sourceless op never reads it.  The focused hot
+			// pair is MOVE.L (An)+,Dn / ADD.L Dn,Dm, so forward a pending source
+			// write without a cycle.  A destination dependency is much rarer and
+			// waits for commit, avoiding a second 32-bit forwarding mux.
 			S_PIPE_REGS: begin
-				if (p_src == SK_REG) src_val <= rf_rdata_a;
-				dst_val <= rf_rdata_b;
-				state <= S_EXEC;
+				if (rf_we && rf_waddr == rr_b) begin
+					state <= S_PIPE_REGS;
+				end
+				else begin
+					if (p_src == SK_REG)
+						src_val <= (rf_we && rf_waddr == rr_a) ? rf_wdata : rf_rdata_a;
+					dst_val <= rf_rdata_b;
+					state <= S_EXEC;
+				end
 			end
 
 			//-------------------------------------------------------- execute

@@ -880,6 +880,26 @@ smcq_ok:
 bsr_a7_forward_ok:
 	move.l	a5,a7
 
+;------------------------ predecoded ADD retirement/register forwarding
+; The resident ADD below selects both read ports on the retiring MOVE's edge.
+; A destination dependency waits for commit; a source-only dependency forwards
+; without giving back the saved decode cycle.  Exercise both cases here.
+	move.l	#$20,d3
+	move.l	#100,d0
+	divu.w	#3,d0		; let the queue make the sequence resident
+	nop
+	nop
+	nop
+	move.l	#10,d2
+	add.l	d2,d2		; both operands depend on the retiring MOVE
+	add.l	d2,d3		; source depends on the immediately prior ADD
+	chkl	d2,20,194
+	chkl	d3,$34,195
+	moveq	#3,d0
+	moveq	#4,d1
+	add.l	d0,d1		; destination depends on the retiring MOVEQ
+	chkl	d1,7,196
+
 ;----------------------------------------------------------------- all done
 	move.w	#$600D,(DONEREG).l
 	stop	#$2700

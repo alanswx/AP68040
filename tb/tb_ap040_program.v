@@ -645,6 +645,8 @@ integer prof_on = 0;
 integer prof_fetch_brf = 0;     // S_FETCH cycles consuming a branch-refill seed
 integer prof_inline_brf = 0;    // refill target dispatched without S_FETCH
 integer prof_inline_brf_from [0:255];
+integer prof_regalu [0:6];      // resident-predecode candidates by opcode family
+integer prof_inline_addl = 0;   // ADD.L Dn,Dn dispatched without S_DECODE
 reg [7:0] prof_prev_state = 0;
 
 // +memlat: request-to-acknowledge latency for the core's memory port,
@@ -681,6 +683,7 @@ initial begin
 		prof_stall[pi] = 0;
 		prof_inline_brf_from[pi] = 0;
 	end
+	for (pi = 0; pi < 7; pi = pi + 1) prof_regalu[pi] = 0;
 end
 always @(posedge clk) if (memlat_on && nreset) begin
 	// state 9 = S_MRD, 10 = S_MWR
@@ -719,8 +722,38 @@ always @(posedge clk) if (prof_on && nreset) begin
 	    prof_prev_state != 8'd3) begin
 		prof_inline_brf = prof_inline_brf + 1;
 		prof_inline_brf_from[prof_prev_state] =
-			prof_inline_brf_from[prof_prev_state] + 1;
+		prof_inline_brf_from[prof_prev_state] + 1;
 	end
+	// Simple register-to-register ALU forms which need no extension word,
+	// effective address, privilege decision, or special execution engine.
+	// Count them at decode before building the one-entry predecode proof.
+	if (dut.core.state == 8'd4) begin
+		if (dut.core.ir[15:12] >= 4'h1 && dut.core.ir[15:12] <= 4'h3 &&
+		    dut.core.ir[5:3] == 3'b000 && dut.core.ir[8:6] == 3'b000)
+			prof_regalu[0] = prof_regalu[0] + 1; // MOVE Dn,Dn
+		else if (dut.core.ir[15:12] == 4'hD && !dut.core.ir[8] &&
+		         dut.core.ir[7:6] != 2'b11 && dut.core.ir[5:3] == 3'b000)
+			prof_regalu[1] = prof_regalu[1] + 1; // ADD Dn,Dn
+		else if (dut.core.ir[15:12] == 4'h9 && !dut.core.ir[8] &&
+		         dut.core.ir[7:6] != 2'b11 && dut.core.ir[5:3] == 3'b000)
+			prof_regalu[2] = prof_regalu[2] + 1; // SUB Dn,Dn
+		else if (dut.core.ir[15:12] == 4'hB && !dut.core.ir[8] &&
+		         dut.core.ir[7:6] != 2'b11 && dut.core.ir[5:3] == 3'b000)
+			prof_regalu[3] = prof_regalu[3] + 1; // CMP Dn,Dn
+		else if (dut.core.ir[15:12] == 4'h8 && !dut.core.ir[8] &&
+		         dut.core.ir[7:6] != 2'b11 && dut.core.ir[5:3] == 3'b000)
+			prof_regalu[4] = prof_regalu[4] + 1; // OR Dn,Dn
+		else if (dut.core.ir[15:12] == 4'hC && !dut.core.ir[8] &&
+		         dut.core.ir[7:6] != 2'b11 && dut.core.ir[5:3] == 3'b000)
+			prof_regalu[5] = prof_regalu[5] + 1; // AND Dn,Dn
+		else if (dut.core.ir[15:12] == 4'hB && dut.core.ir[8] &&
+		         dut.core.ir[7:6] != 2'b11 && dut.core.ir[5:3] == 3'b000)
+			prof_regalu[6] = prof_regalu[6] + 1; // EOR Dn,Dn
+	end
+	if (dut.core.state == 8'd190 && prof_prev_state != 8'd4 &&
+	    dut.core.ir[15:12] == 4'hD && !dut.core.ir[8] &&
+	    dut.core.ir[7:6] == 2'b10 && dut.core.ir[5:3] == 3'b000)
+		prof_inline_addl = prof_inline_addl + 1;
 	prof_prev_state <= dut.core.state;
 end
 
@@ -770,14 +803,21 @@ task prof_dump;
 		for (pi = 0; pi < 256; pi = pi + 1)
 			if (prof_inline_brf_from[pi] != 0)
 				$display("PROF     from state %0d: %0d",
-				         pi, prof_inline_brf_from[pi]);
+					         pi, prof_inline_brf_from[pi]);
+		$display("PROF   predecode MOVE/ADD/SUB/CMP/OR/AND/EOR: %0d %0d %0d %0d %0d %0d %0d",
+		         prof_regalu[0], prof_regalu[1], prof_regalu[2],
+		         prof_regalu[3], prof_regalu[4], prof_regalu[5],
+		         prof_regalu[6]);
+		$display("PROF   inline ADD.L Dn,Dn dispatches: %0d", prof_inline_addl);
 		prof_fetch_brf = 0;
 		prof_inline_brf = 0;
+		prof_inline_addl = 0;
 		for (pi = 0; pi < 256; pi = pi + 1) begin
 			prof_cnt[pi] = 0;
 			prof_stall[pi] = 0;
 			prof_inline_brf_from[pi] = 0;
 		end
+		for (pi = 0; pi < 7; pi = pi + 1) prof_regalu[pi] = 0;
 	end
 endtask
 
