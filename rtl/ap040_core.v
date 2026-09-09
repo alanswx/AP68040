@@ -1583,8 +1583,25 @@ task mwr;
 	input [31:0] d;
 	input [7:0] ret;
 	begin
-		m_addr_r <= a; m_size <= size; m_wdat <= d; m_wr <= 1; m_issued <= 0;
+		m_addr_r <= a; m_size <= size; m_wdat <= d; m_wr <= 1;
 		r_m_ret <= ret; state <= S_MWR;
+		// Normal aligned destination writes can claim the shared port while the
+		// execution stage enters S_MWR.  Completion and fault retirement remain
+		// in S_MWR, so this removes only its request-setup cycle; MMIO, split
+		// accesses, exception frames, and specialized helpers keep the old path.
+		if (state == S_EXEC && a[31:28] == 4'h0 &&
+		    !epf_pend && !mem_req && !mem_ack &&
+		    ((size == `AP040_SZ_B) ||
+		     ((size == `AP040_SZ_W) && !a[0]) ||
+		     ((size == `AP040_SZ_L) && !(|a[1:0])))) begin
+			mem_req <= 1; mem_write <= 1; mem_instr <= 0;
+			mem_size <= size; mem_addr <= a; mem_wdata <= d;
+			fc_r <= fc_ovr_v ? fc_ovr :
+			        (sr_s ? `AP040_FC_SUPER_DATA : `AP040_FC_USER_DATA);
+			m_issued <= 1;
+			epf_issue = 1;
+		end
+		else m_issued <= 0;
 	end
 endtask
 
