@@ -1549,18 +1549,6 @@ wire        m_cross  = tc[15] &&
                        (((m_addr_r & m_pgmask) + {29'd0, m_nbytes}) >
                         (m_pgmask + 32'd1));
 
-function automatic early_operand_read;
-	input [31:0] a;
-	input [1:0] size;
-	begin
-		early_operand_read =
-		    a[31:28] == 4'h0 && !epf_pend && !mem_req && !mem_ack &&
-		    ((size == `AP040_SZ_B) ||
-		     ((size == `AP040_SZ_W) && !a[0]) ||
-		     ((size == `AP040_SZ_L) && !(|a[1:0])));
-	end
-endfunction
-
 task mrd;
 	input [31:0] a;
 	input [1:0] size;
@@ -1574,7 +1562,11 @@ task mrd;
 		// and system/FPU helpers retain the established setup cycle.  Translation,
 		// cache lookup, faults and acknowledgement retirement are unchanged.
 		if ((state == S_PIPE_START || state == S_PIPE_SRD ||
-		     state == S_PIPE_DEA) && early_operand_read(a, size)) begin
+		     state == S_PIPE_DEA) &&
+		    a[31:28] == 4'h0 && !epf_pend && !mem_req && !mem_ack &&
+		    ((size == `AP040_SZ_B) ||
+		     ((size == `AP040_SZ_W) && !a[0]) ||
+		     ((size == `AP040_SZ_L) && !(|a[1:0])))) begin
 			mem_req <= 1; mem_write <= 0; mem_instr <= 0;
 			mem_size <= size; mem_addr <= a;
 			fc_r <= fc_ovr_v ? fc_ovr :
@@ -2643,37 +2635,23 @@ always @(posedge clk) begin
 						// modes retain the generic EA engine.
 						case (src_mode_r)
 							3'b010: begin
-								ea_addr <= rf_rdata_a;
-								if (early_operand_read(rf_rdata_a, p_ssize)) begin
-									if (p_dst == DK_REG) rr_b <= p_dreg;
-									mrd(rf_rdata_a, p_ssize, S_PIPE_SDONE);
-								end
-								else state <= S_PIPE_SRD;
+								if (p_dst == DK_REG) rr_b <= p_dreg;
+								mrd(rf_rdata_a, p_ssize, S_PIPE_SDONE);
 							end
 							3'b011: begin
-								ea_addr <= rf_rdata_a;
+								if (p_dst == DK_REG) rr_b <= p_dreg;
+								mrd(rf_rdata_a, p_ssize, S_PIPE_SDONE);
 								rfw({1'b1, src_rn_r},
 								    rf_rdata_a + an_adj(src_rn_r, p_ssize));
 								u_rec({1'b1, src_rn_r}, rf_rdata_a);
-								if (early_operand_read(rf_rdata_a, p_ssize)) begin
-									if (p_dst == DK_REG) rr_b <= p_dreg;
-									mrd(rf_rdata_a, p_ssize, S_PIPE_SDONE);
-								end
-								else state <= S_PIPE_SRD;
 							end
-							3'b100: begin
-								ea_addr <= rf_rdata_a - an_adj(src_rn_r, p_ssize);
-								rfw({1'b1, src_rn_r},
-								    rf_rdata_a - an_adj(src_rn_r, p_ssize));
+							3'b100: begin : pipe_predec_read
+								reg [31:0] predec_addr;
+								predec_addr = rf_rdata_a - an_adj(src_rn_r, p_ssize);
+								if (p_dst == DK_REG) rr_b <= p_dreg;
+								mrd(predec_addr, p_ssize, S_PIPE_SDONE);
+								rfw({1'b1, src_rn_r}, predec_addr);
 								u_rec({1'b1, src_rn_r}, rf_rdata_a);
-								if (early_operand_read(
-								    rf_rdata_a - an_adj(src_rn_r, p_ssize),
-								    p_ssize)) begin
-									if (p_dst == DK_REG) rr_b <= p_dreg;
-									mrd(rf_rdata_a - an_adj(src_rn_r, p_ssize),
-									    p_ssize, S_PIPE_SDONE);
-								end
-								else state <= S_PIPE_SRD;
 							end
 							default:
 								ea_start(src_mode_r, src_rn_r, p_ssize,
