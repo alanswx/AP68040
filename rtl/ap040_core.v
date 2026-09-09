@@ -1556,12 +1556,13 @@ task mrd;
 	begin
 		m_addr_r <= a; m_size <= size; m_wr <= 0;
 		r_m_ret <= ret; state <= S_MRD;
-		// Ordinary aligned reads cannot cross a page.  When the fetch queue
-		// does not own the shared port, issue them while entering S_MRD instead
-		// of spending the first S_MRD cycle copying the already-registered
-		// request fields onto that port.  Translation, cache lookup, faults and
-		// acknowledgement retirement remain on their existing paths.
-		if (state != S_MOVES2 && !epf_pend && !mem_req && !mem_ack &&
+		// Normal operand-pipeline reads from on-board RAM cannot cross a page.
+		// Issue only that high-coverage, side-effect-free subset while entering
+		// S_MRD.  MMIO, exception/return, MOVES, effective-address indirection,
+		// and system/FPU helpers retain the established setup cycle.  Translation,
+		// cache lookup, faults and acknowledgement retirement are unchanged.
+		if ((state == S_PIPE_SRD || state == S_PIPE_DEA) &&
+		    a[31:28] == 4'h0 && !epf_pend && !mem_req && !mem_ack &&
 		    ((size == `AP040_SZ_B) ||
 		     ((size == `AP040_SZ_W) && !a[0]) ||
 		     ((size == `AP040_SZ_L) && !(|a[1:0])))) begin
