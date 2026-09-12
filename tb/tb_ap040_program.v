@@ -19,6 +19,10 @@
 
 module tb_ap040_program;
 
+`ifdef AP040_EXACT_SIEVE_MONITOR
+exact_sieve_monitor sieve_monitor();
+`endif
+
 reg clk = 0;
 reg nreset = 0;
 
@@ -782,6 +786,8 @@ task prof_dump;
 endtask
 
 integer timeout;
+integer maxcycles = 20000000;
+integer selected_phase = -1;
 integer i;
 
 task run_phase;
@@ -805,7 +811,7 @@ task run_phase;
 		nreset = 1;
 
 		timeout = 0;
-		while (result == 0 && timeout < 20000000) begin
+		while (result == 0 && timeout < maxcycles) begin
 			@(posedge clk);
 			timeout = timeout + 1;
 		end
@@ -824,15 +830,21 @@ endtask
 
 initial begin
 	errors = 0;
+	if ($value$plusargs("maxcycles=%d", maxcycles)) begin end
+	if ($value$plusargs("phase=%d", selected_phase)) begin end
 	if (!$value$plusargs("prog=%s", prog_file)) begin
 		$display("FAIL: missing +prog=<hexfile>");
 		$finish;
 	end
 	$display("tb_ap040_program: running %0s", prog_file);
 
-	run_phase(0);
-	run_phase(1);
-	run_phase(2);
+	if (selected_phase >= 0 && selected_phase <= 2)
+		run_phase(selected_phase);
+	else begin
+		run_phase(0);
+		run_phase(1);
+		run_phase(2);
+	end
 
 	if (errors == 0) $display("ALL TESTS PASSED");
 	else             $display("TEST FAILED with %0d errors", errors);
