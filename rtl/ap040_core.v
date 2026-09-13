@@ -1645,6 +1645,35 @@ task ea_start;
 	end
 endtask
 
+// Ordinary operands can select the base register and set up their extension
+// request together. Do not consume an extension here: S_IMMF supplies the
+// qualified edge for port A to settle, preserves queue/fault handling, and
+// retains the indexed pending-write fallback before capturing the base.
+// Specialized EA callers keep their existing S_EA_DISP boundary.
+task ea_operand_start;
+	input [2:0] mode;
+	input [2:0] rn;
+	input [1:0] size;
+	input [7:0] ret;
+	begin
+		ea_start(mode, rn, size, ret);
+		case (mode)
+			3'b101: immf(2'd1, S_EA_D16);
+			3'b110: immf(2'd1, S_EA_EXTW);
+			3'b111: begin
+				case (rn)
+					3'b000: begin ea_absl <= 0; immf(2'd1, S_EA_ABS); end
+					3'b001: begin ea_absl <= 1; immf(2'd2, S_EA_ABS); end
+					3'b010: begin ea_pcmode <= 1; immf(2'd1, S_EA_D16); end
+					3'b011: begin ea_pcmode <= 1; immf(2'd1, S_EA_EXTW); end
+					default: begin end
+				endcase
+			end
+			default: begin end
+		endcase
+	end
+endtask
+
 task exc;
 	input [7:0] vec;
 	input [3:0] fmt;
@@ -2571,7 +2600,21 @@ always @(posedge clk) begin
 					        epf_fwd_pc ? epf_fwd_word : epf_data[epf_head]};
 					pc <= pc + 32'd2;
 					epf_pop = 2'd1;
-					if (imm_n == 2'd1) state <= r_imm_ret;
+					if (imm_n == 2'd1) begin
+						// Prepare the indexed EA read port while consuming its
+						// extension. S_EA_EXTW2 retains all brief/full-format
+						// arithmetic and legality checks; no extra EA adder.
+						// Serialize any pending register/stack-bank write through
+						// the old EXTW stage rather than capturing an old base.
+						if (r_imm_ret == S_EA_EXTW && !rf_we && !aux_we) begin
+							extw <= epf_fwd_pc ? epf_fwd_word : epf_data[epf_head];
+							rr_b <= epf_fwd_pc ? epf_fwd_word[15:12] :
+							        epf_data[epf_head][15:12];
+							ea_base_v <= ea_pcmode ? ea_pcb : rf_rdata_a;
+							state <= S_EA_EXTW2;
+						end
+						else state <= r_imm_ret;
+					end
 					else imm_n <= imm_n - 2'd1;
 				end
 				else if (!epf_armed || epf_next != pc || epf_super != sr_s)
@@ -2775,7 +2818,7 @@ always @(posedge clk) begin
 					SK_MEM: begin
 						// Decode already selected the source An.  Resolve the three
 						// simple modes here and bypass S_EA_DISP; extension-bearing
-						// modes retain the generic EA engine.
+						// modes overlap EA selection with extension-request setup.
 						case (src_mode_r)
 							3'b010: begin
 								if (p_dst == DK_REG) rr_b <= p_dreg;
@@ -2797,7 +2840,7 @@ always @(posedge clk) begin
 								u_rec({1'b1, src_rn_r}, rf_rdata_a);
 							end
 							default:
-								ea_start(src_mode_r, src_rn_r, p_ssize,
+								ea_operand_start(src_mode_r, src_rn_r, p_ssize,
 								         S_PIPE_SRD);
 						endcase
 					end
