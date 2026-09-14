@@ -836,6 +836,11 @@ initial begin
 	c_instr = 1;
 	line_base = mread_count;
 	cpu_read_count_sized(32'h0000_F000, 2'b10, d, fill_cycles);   // fill
+	// Force the ordinary seed to require a new RAM read. Without this,
+	// idle-admission completion also makes the repeated F000 a two-clock
+	// hit, legitimately tying the predictor rather than testing fallback.
+	@(negedge clk); c_addr = 32'h0000_F00C;
+	repeat (2) @(posedge clk);
 	cpu_read_count_sized(32'h0000_F000, 2'b10, d, normal_cycles); // seed
 	cpu_read_count_sized(32'h0000_F006, 2'b01, d, fast_cycles);   // use/chain
 	if (d !== 32'h0000_CDEF) begin
@@ -919,6 +924,63 @@ initial begin
 		end
 	end
 	mem_lat = 2'd2;
+
+	//------------------------------------------------------------------
+	// T14: directly exercise current-request RAM settlement, stale indices,
+	// qualified physical tag changes and a ce-independent invalidation.
+	//------------------------------------------------------------------
+	cinv_req = 1; cinv_ic = 1; cinv_dc = 1;
+	@(negedge clk);
+	while (!cinv_done) @(posedge clk);
+	cinv_req = 0;
+	repeat (4) @(posedge clk);
+	mem[32'hA000>>2] = 32'h1234_5678;
+	mem[32'hA004>>2] = 32'h9ABC_DEF0;
+	mem[32'hB000>>2] = 32'hDEAD_BEEF;
+	c_instr = 0;
+	expect_read(32'hA000, 32'h1234_5678, 14);
+	@(negedge clk); c_addr = 32'hA000;
+	repeat (2) @(posedge clk);
+	cpu_read_count_sized(32'hA001, 2'b00, d, fast_cycles);
+	if (d !== 32'h34 || fast_cycles != 2) begin
+		$display("FAIL test 14: settled byte data=%h cycles=%0d",d,fast_cycles);
+		errors = errors + 1;
+	end
+	cpu_read_count_sized(32'hA002, 2'b01, d, fast_cycles);
+	if (d !== 32'h5678 || fast_cycles != 2) begin
+		$display("FAIL test 14: settled word data=%h cycles=%0d",d,fast_cycles);
+		errors = errors + 1;
+	end
+	@(negedge clk); c_addr = 32'hA004;
+	repeat (2) @(posedge clk);
+	cpu_read_count_sized(32'hA000, 2'b10, d, normal_cycles);
+	if (d !== 32'h1234_5678 || normal_cycles != 3) begin
+		$display("FAIL test 14: stale word must fallback data=%h cycles=%0d",d,normal_cycles);
+		errors = errors + 1;
+	end
+	// Same index, different physical tag: never reuse A000 as B000.
+	line_base = mread_count;
+	cpu_read_count_sized(32'hB000, 2'b10, d, fill_cycles);
+	if (d !== 32'hDEAD_BEEF || mread_count == line_base) begin
+		$display("FAIL test 14: physical tag mismatch data=%h reads=%0d",d,mread_count-line_base);
+		errors = errors + 1;
+	end
+	// Data RAM holds the old A000 across ce=0, but a snoop invalidates
+	// tags and metadata in the free-running clock domain.
+	@(negedge clk); c_addr = 32'hA000;
+	repeat (2) @(posedge clk);
+	@(negedge clk); ce_run = 0;
+	mem[32'hA000>>2] = 32'h7654_3210;
+	snoop(32'hA000);
+	repeat (2) @(posedge clk);
+	@(negedge clk); ce_run = 1;
+	line_base = mread_count;
+	cpu_read_count_sized(32'hA000, 2'b10, d, fill_cycles);
+	if (d !== 32'h7654_3210 || mread_count == line_base) begin
+		$display("FAIL test 14: frozen-ce snoop data=%h reads=%0d",d,mread_count-line_base);
+		errors = errors + 1;
+	end
+	$display("EARLY_ADMISSION_TESTS_COMPLETE");
 
 	if (errors == 0) $display("ALL TESTS PASSED");
 	else $display("TEST FAILED with %0d errors", errors);
