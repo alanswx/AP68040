@@ -491,7 +491,11 @@ assign c_ack   = (pass_active && !post_active) ? m_ack : ack_r;
 // rest of the line (Sieve, 2026-09-14).  The core's accept is idempotent.
 assign c_line_stb  = iline_valid && !iline_pending;
 assign c_busy      = fill_active || (cst == C_TAGW) || post_active;
-assign m_posted    = post_active;
+// A spanning store merges from its line read, which completes one cycle
+// after admission; a capture-cycle acknowledge would arrive first and
+// force the invalidate fallback (13 % more data fills in the Speedometer
+// profile), so only non-spanning stores are reported posted at once.
+assign m_posted    = post_active && (!r_span2 || sline_ready);
 assign c_line_tag  = iline_tag;
 assign c_line_data = iline_data;
 assign c_rdata = pass_active ? m_rdata : rdata_r;

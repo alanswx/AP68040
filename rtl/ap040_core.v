@@ -1549,6 +1549,32 @@ task rfw;
 	end
 endtask
 
+// SK_IMM source with a register destination: consume the immediate here,
+// select the destination on port B and go straight to S_PIPE_REGS
+// (capture and retire) instead of letting S_PIPE_START copy the same
+// values a cycle later.  Same guards as immf's decode-time inline; when
+// they fail the established path is taken.
+task immf_reg;
+	input [1:0] n;
+	input [3:0] da;
+	reg  [31:0] v;
+	begin
+		if (state == S_DECODE && !epf_flushed && !epf_pend && !mem_ack &&
+		    ((n == 2'd2) ? epf_ready_pc2 : epf_ready_pc)) begin
+			v = (n == 2'd2) ? {epf_data[epf_head], epf_data[epf_head + 3'd1]}
+			                : {16'd0, epf_data[epf_head]};
+			imm <= v; x_ext <= v; src_val <= v;
+			imm_n <= n; r_imm_ret <= S_PIPE_START;
+			pc <= pc + ((n == 2'd2) ? 32'd4 : 32'd2);
+			epf_pop = n;
+			epf_issue = 1;
+			rr_b <= da;
+			state <= S_PIPE_REGS;
+		end
+		else immf(n, S_PIPE_START);
+	end
+endtask
+
 task immf;
 	input [1:0] n;
 	input [7:0] ret;
@@ -1688,15 +1714,41 @@ task ea_operand_start;
 		ea_start(mode, rn, size, ret);
 		// From S_PIPE_START, with the base register already on port A and
 		// the extension word resident in the queue, consume it here instead
-		// of spending S_IMMF on the same pop.  Same guards as the decode-time
-		// inline; a pending register/stack write keeps the old path so the
-		// base captured below is never stale.
-		ext_inline = (state == S_PIPE_START) && !epf_flushed && !epf_pend &&
+		// of spending S_IMMF on the same pop.  A pending register/stack
+		// write keeps the old path so the base captured below is never
+		// stale.  An outstanding queue fetch no longer blocks this: the
+		// data transfer it leads to cannot issue while that fetch is
+		// pending (mrd/mwr and S_MRD/S_MWR all hold on epf_pend), so
+		// advancing the EA computation overlaps the fetch instead of
+		// waiting for it in S_IMMF.
+		ext_inline = (state == S_PIPE_START) && !epf_flushed &&
 		             !mem_ack && epf_ready_pc && (rr_a == {1'b1, rn}) &&
 		             !rf_we && !aux_we;
 		case (mode)
 			3'b101:
-				if (ext_inline) begin
+				if (ext_inline && ret == S_PIPE_SRD) begin
+					// d16(An) source: base on port A, displacement at the
+					// queue head, so the read issues now.  Its hint went
+					// out this cycle (hint_pipe_addr computes the same
+					// sum), and S_EA_D16 and S_PIPE_SRD are skipped.
+					pc <= pc + 32'd2;
+					epf_pop = 2'd1;
+					epf_issue = 1;
+					if (p_dst == DK_REG) rr_b <= p_dreg;
+					mrd(rf_rdata_a + sxw(epf_data[epf_head]), size, S_PIPE_SDONE);
+				end
+				else if (ext_inline && ret == S_PIPE_DEA) begin
+					// d16(An) destination: same, landing where S_PIPE_DEA
+					// would have (a read-modify-write reads now).
+					pc <= pc + 32'd2;
+					epf_pop = 2'd1;
+					epf_issue = 1;
+					dst_addr <= rf_rdata_a + sxw(epf_data[epf_head]);
+					if (p_rmw)
+						mrd(rf_rdata_a + sxw(epf_data[epf_head]), size, S_PIPE_DDONE);
+					else state <= S_EXEC;
+				end
+				else if (ext_inline) begin
 					imm <= {16'd0, epf_data[epf_head]};
 					pc <= pc + 32'd2;
 					epf_pop = 2'd1;
@@ -2290,10 +2342,26 @@ wire        hint_bcc  = (state == S_DECODE) && (ir[15:12] == 4'h6) &&
 // The operand pipeline's own reads (the mrd sites in S_PIPE_START,
 // S_PIPE_SRD and S_PIPE_DEA) issue at the end of those states from the
 // same values shown here, so the hint precedes each by exactly one cycle.
-wire        hint_pipe = (state == S_PIPE_START) && (p_src == SK_MEM);
-wire [31:0] hint_pipe_addr = (src_mode_r == 3'b100)
-                           ? rf_rdata_a - an_adj(src_rn_r, p_ssize)
-                           : rf_rdata_a;
+wire        hint_pipe_src = (state == S_PIPE_START) && (p_src == SK_MEM);
+// The registered part of ea_operand_start's inline qualification.  The
+// in-cycle terms (mem_ack, epf_flushed) stay out: the hint is
+// speculative, and through the address bus they would close a
+// combinational loop (acknowledge -> hint -> translation -> acknowledge,
+// 784 nodes in the fitter, 2026-09-14).  A hint that guesses wrong only
+// costs the read its idle-read match.
+wire        hint_ext_ok   = epf_ready_pc && !rf_we && !aux_we;
+wire        hint_pipe_dst = (state == S_PIPE_START) && (p_src != SK_MEM) &&
+                            (p_dst == DK_MEM) && p_rmw &&
+                            (dst_mode_r == 3'b101) && hint_ext_ok &&
+                            (rr_a == {1'b1, dst_rn_r});
+wire        hint_pipe = hint_pipe_src || hint_pipe_dst;
+wire [31:0] hint_d16_addr = rf_rdata_a + sxw(epf_data[epf_head]);
+wire [31:0] hint_pipe_addr = hint_pipe_dst ? hint_d16_addr :
+                             (src_mode_r == 3'b100)
+                           ? rf_rdata_a - an_adj(src_rn_r, p_ssize) :
+                             ((src_mode_r == 3'b101) && hint_ext_ok &&
+                              (rr_a == {1'b1, src_rn_r}))
+                           ? hint_d16_addr : rf_rdata_a;
 wire        hint_ea   = (state == S_PIPE_SRD) ||
                         ((state == S_PIPE_DEA) && p_rmw);
 wire [31:0] hint_addr = hint_data ? m_addr_r :
@@ -5638,12 +5706,13 @@ always @(posedge clk) begin
 								p_src <= SK_IMM;
 								if (d_mode == 3'b000) begin
 									p_dst <= DK_REG; p_dreg <= {1'b0, d_rn};
+									immf_reg((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, {1'b0, d_rn});
 								end
 								else begin
 									p_dst <= DK_MEM; p_rmw <= 1;
 									dst_mode_r <= d_mode; dst_rn_r <= d_rn;
+									immf((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START);
 								end
-								immf((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START);
 							end
 						end
 					end
@@ -5682,7 +5751,9 @@ always @(posedge clk) begin
 								p_dst <= DK_MEM;
 								dst_mode_r <= d_op8_6; dst_rn_r <= d_reg9;
 							end
-							if (ea_is_imm)
+							if (ea_is_imm && (d_op8_6 == 3'b000 || d_op8_6 == 3'b001))
+								immf_reg((move_size == `AP040_SZ_L) ? 2'd2 : 2'd1, {d_op8_6[0], d_reg9});
+							else if (ea_is_imm)
 								immf((move_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START);
 							else pipe_go;
 						end
@@ -5717,7 +5788,7 @@ always @(posedge clk) begin
 								else if (ea_is_imm) p_src <= SK_IMM;
 								else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; end
 								p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-								if (ea_is_imm) immf(2'd1, S_PIPE_START);
+								if (ea_is_imm) immf_reg(2'd1, {1'b0, d_reg9});
 								else pipe_go;
 							end
 						end
@@ -5733,7 +5804,7 @@ always @(posedge clk) begin
 								else if (ea_is_imm) p_src <= SK_IMM;
 								else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; end
 								p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-								if (ea_is_imm) immf(2'd2, S_PIPE_START);
+								if (ea_is_imm) immf_reg(2'd2, {1'b0, d_reg9});
 								else pipe_go;
 							end
 						end
