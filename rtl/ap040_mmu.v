@@ -176,9 +176,38 @@ wire hit0 = lk_fresh && atc_v[{l_row, 2'd0}] && (a_w0[44:28] == l_tag);
 wire hit1 = lk_fresh && atc_v[{l_row, 2'd1}] && (a_w1[44:28] == l_tag);
 wire hit2 = lk_fresh && atc_v[{l_row, 2'd2}] && (a_w2[44:28] == l_tag);
 wire hit3 = lk_fresh && atc_v[{l_row, 2'd3}] && (a_w3[44:28] == l_tag);
-wire atc_hit = hit0 | hit1 | hit2 | hit3;
+wire pipe_hit = hit0 | hit1 | hit2 | hit3;
+wire [EW-1:0] pipe_ent = hit0 ? a_w0 : hit1 ? a_w1 : hit2 ? a_w2 : a_w3;
 
-wire [EW-1:0] h_ent = hit0 ? a_w0 : hit1 ? a_w1 : hit2 ? a_w2 : a_w3;
+// One-entry copy of the most recent piped ATC hit.  A request whose
+// {row, tag} equals it translates in its own request cycle instead of
+// waiting for the one-clock lookup pipe; sequential fetches and most data
+// traffic stay in one page for long stretches.  The copy is dropped on
+// every ATC write (walker fill, PFLUSH clear or sweep), on any TC change
+// and on reset, so it can never disagree with the array it mirrors.  It
+// carries no state of its own: permissions, cache mode and the M bit come
+// from the copied entry and go through the same fault/walk decisions.
+reg          u_valid;
+reg    [4:0] u_row;
+reg   [16:0] u_tag;
+reg [EW-1:0] u_ent;
+reg   [31:0] u_tc;
+always @(posedge clk) begin
+	u_tc <= tc;
+	if (!nreset || fill_we || sweep_on || pf_req || (tc != u_tc))
+		u_valid <= 0;
+	else if (pipe_hit) begin
+		u_valid <= 1;
+		u_row   <= l_row;
+		u_tag   <= l_tag;
+		u_ent   <= pipe_ent;
+	end
+end
+wire u_hit = u_valid && (u_row == a_row) && (u_tag == a_tag);
+
+wire atc_hit = u_hit | pipe_hit;
+
+wire [EW-1:0] h_ent = u_hit ? u_ent : pipe_ent;
 wire [19:0] h_pa   = h_ent[27:8];
 wire  [7:0] h_attr = h_ent[7:0];
 wire        h_s    = h_attr[4];
@@ -219,8 +248,8 @@ wire atc_mmiss = atc_hit && c_write && !h_m && !h_w;
 
 // lk_fresh gates atc_hit, so a walk is only started once the piped row
 // has been judged against the live request
-wire need_walk = tc_e && !ttr_hit && lk_fresh && (!atc_hit || atc_mmiss) &&
-                 !atc_fault;
+wire need_walk = tc_e && !ttr_hit && (lk_fresh || u_hit) &&
+                 (!atc_hit || atc_mmiss) && !atc_fault;
 
 wire [31:0] pa_out =
 	ttr_hit ? c_addr :
@@ -332,7 +361,7 @@ wire w_denied = !w_pt && ((w_user && w_desc[7]) ||
 // is fresh: with a stale pipe need_walk/atc_fault are still low and the
 // request would otherwise pass untranslated.
 wire pass_ok = c_req && !c_flt && !need_walk && !ttr_fault && !atc_fault &&
-               (!tc_e || ttr_hit || lk_fresh) &&
+               (!tc_e || ttr_hit || lk_fresh || u_hit) &&
                (wst == W_IDLE) && !w_active && !pf_req && !pt_req;
 
 assign m_req   = pass_ok;
