@@ -48,6 +48,14 @@ module ap040_cache
 	input             c_nocache,
 	output            c_ack,
 	output     [31:0] c_rdata,
+	// Instruction line sideband: one cycle after an instruction hit is
+	// acknowledged, the whole 16-byte physical line it came from (word 0 in
+	// [127:96]) with its address.  The core may take any of its words that
+	// continue its prefetch stream; it must never treat this as an
+	// acknowledge or as a translation of anything.
+	output            c_line_stb,
+	output     [31:4] c_line_tag,
+	output    [127:0] c_line_data,
 
 	// master side (to the bus adapter)
 	output            m_req,
@@ -97,10 +105,12 @@ module ap040_cache
 localparam TAGW = 22;
 localparam ROWW = 2 + 4 + 4*TAGW;
 
-// One data RAM per way, each {bank, set, word}: reading all four at once
-// lets the hit be served in the same cycle the tag compare resolves, so a
-// hit costs two cycles instead of three.  Same total bits as the single
-// {bank, set, way, word} array it replaces.
+// Four data RAMs, word-interleaved across the ways: array k holds, at index
+// {bank, set, way}, the word w of that way for which (way + w) mod 4 == k.
+// A word-wise read (word w of all four ways, for the tag compare to pick
+// one) addresses array k at way (k - w) mod 4; a line-wise read of one way
+// addresses every array at that way and returns the whole 16-byte line in a
+// single cycle.  Same total bits as the plain per-way layout.
 (* ramstyle = "no_rw_check" *) reg [31:0] cdata0 [0:511];
 (* ramstyle = "no_rw_check" *) reg [31:0] cdata1 [0:511];
 (* ramstyle = "no_rw_check" *) reg [31:0] cdata2 [0:511];
@@ -137,16 +147,17 @@ dpram #(7, ROWW) ctag_ram
 	.q_b       ()
 );
 
+wire  [8:0] cd_ridx0, cd_ridx1, cd_ridx2, cd_ridx3;
 always @(posedge clk) begin
 	if (ce & cd_we[0]) cdata0[cd_widx] <= cd_wdat;
 	if (ce & cd_we[1]) cdata1[cd_widx] <= cd_wdat;
 	if (ce & cd_we[2]) cdata2[cd_widx] <= cd_wdat;
 	if (ce & cd_we[3]) cdata3[cd_widx] <= cd_wdat;
 	if (ce & cd_rd_en) begin
-		data_q0 <= cdata0[cd_ridx];
-		data_q1 <= cdata1[cd_ridx];
-		data_q2 <= cdata2[cd_ridx];
-		data_q3 <= cdata3[cd_ridx];
+		data_q0 <= cdata0[cd_ridx0];
+		data_q1 <= cdata1[cd_ridx1];
+		data_q2 <= cdata2[cd_ridx2];
+		data_q3 <= cdata3[cd_ridx3];
 	end
 end
 
@@ -219,11 +230,19 @@ reg         pass_store_chk;      // C_PASS owns an aligned store tag lookup
 // be acknowledged directly from C_IDLE, without another synchronous tag/data
 // lookup.  The buffer is strictly a cache-hit latency optimization: it neither
 // advances architectural PC nor creates a new memory request.
-reg         ipred_pending;
-reg         ipred_valid;
-reg   [1:0] ipred_way;
-reg  [29:0] ipred_addr;          // aligned physical address [31:2]
-reg  [31:0] ipred_data;
+// Instruction line buffer.  A normal I-cache hit has identified the
+// resident way; the following cycle reads that way's whole line (all four
+// arrays at index {1, set, way}) into this private copy.  Any later
+// instruction request inside the line is acknowledged from C_IDLE without a
+// tag or data lookup, and the line is also offered to the core as a
+// sideband so its prefetch queue can take the remaining words at once.
+reg          iline_pending;
+reg          iline_valid;
+reg    [1:0] iline_way;
+reg   [27:0] iline_tag;          // physical address [31:4]
+reg  [127:0] iline_data;         // word 0 in [127:96]
+reg          iline_stb;          // offer the line to the core this cycle
+reg          iline_stb_pend;     // a buffer hit acknowledged: offer next cycle
 
 wire [21:0] t_w0 = tag_q[21:0];
 wire [21:0] t_w1 = tag_q[43:22];
@@ -382,6 +401,9 @@ assign m_wdata = c_wdata;
 assign m_fc    = c_fc;
 
 assign c_ack   = pass_active ? m_ack : ack_r;
+assign c_line_stb  = iline_stb && iline_valid;
+assign c_line_tag  = iline_tag;
+assign c_line_data = iline_data;
 assign c_rdata = pass_active ? m_rdata : rdata_r;
 
 assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
@@ -444,21 +466,31 @@ assign inv_idx  = snoop_wr        ? {1'b0, s_addr[9:4]} :
                   store_inv_lost ? {1'b0, store_inv_set} :
                   (cst == C_IDLE) ? {1'b0, c_addr[9:4]} : {1'b0, winv_set2};
 
-// the four ways arrive together; the tag compare picks one
-wire [31:0] data_hit = (hit_way == 2'd0) ? data_q0 :
-                       (hit_way == 2'd1) ? data_q1 :
-                       (hit_way == 2'd2) ? data_q2 : data_q3;
+// The four ways' copies of the requested word arrive together; the tag
+// compare picks one.  Word w of way v sits in array (v + w) mod 4.
+wire  [1:0] q_word = (cst == C_IDLE) ? c_addr[3:2] :
+                     (cst == C_PASS) ? r_beat : r_addr[3:2];
+wire  [1:0] q_arr  = hit_way + q_word;
+wire [31:0] data_hit = (q_arr == 2'd0) ? data_q0 :
+                       (q_arr == 2'd1) ? data_q1 :
+                       (q_arr == 2'd2) ? data_q2 : data_q3;
 
-// The prediction is one-shot on the instruction side.  An intervening DATA
-// request cannot displace an instruction-cache line (the banks have separate
-// tag rows), and ipred_data is a private copy, so normal loads/stores may pass
-// without killing it.  A nonmatching instruction request clears it, which
-// proves that its source line cannot have been displaced between creation and
-// use.  CINV/reset clear it separately below.
+// An intervening DATA request cannot displace an instruction-cache line
+// (the banks have separate tag rows), and the buffer is a private copy, so
+// loads/stores may pass without killing it.  A nonmatching instruction
+// request clears it before it can miss and refill, which proves that the
+// buffered line cannot have been displaced while the buffer was valid.
+// CINV/reset clear it separately below.
+// (ipred_hit keeps its historical name: the simulator harness probes it.)
 wire ipred_hit = (cst == C_IDLE) && c_req && !ack_r && !c_write && c_instr &&
                  ie && !c_nocache && fits_long && !ci_inv_pend &&
-                 !(cinv_req && !cinv_done) && ipred_valid &&
-                 (c_addr[31:2] == ipred_addr);
+                 !(cinv_req && !cinv_done) && iline_valid &&
+                 (c_addr[31:4] == iline_tag);
+wire iline_hit = ipred_hit;
+wire [31:0] iline_lw = (c_addr[3:2] == 2'd0) ? iline_data[127:96] :
+                       (c_addr[3:2] == 2'd1) ? iline_data[95:64]  :
+                       (c_addr[3:2] == 2'd2) ? iline_data[63:32]  :
+                                               iline_data[31:0];
 
 // Read only the page-offset-indexed arrays while idle. This is not a
 // speculative physical hit: c_req/rd_accept must still come from the MMU
@@ -480,8 +512,8 @@ always @(posedge clk) begin
 		idle_tag_valid <= !tag_we && !inv_wren;
 		if (inv_wren || (ce && |cd_we)) idle_data_valid <= 0;
 		if (ce && cd_rd_en) begin
-			idle_data_idx <= cd_ridx;
-			idle_data_valid <= (cst == C_IDLE) && !ipred_read &&
+			idle_data_idx <= {c_instr, a_set, c_addr[3:2]};
+			idle_data_valid <= (cst == C_IDLE) && !iline_read &&
 			                   !inv_wren && !(|cd_we);
 		end
 	end
@@ -492,28 +524,30 @@ wire idle_hit = rd_accept && !ipred_hit && !err_hold && !m_err &&
                 (idle_tag_idx == a_row) && look_hit &&
                 !tag_we && !inv_wren && !look_snooped && !snoop_look_row;
 
-// A regular instruction hit seeds the first lookahead.  A lookahead hit can
-// chain to the following word.  Never cross a cache-line boundary: the next
-// line needs its own tag lookup even when its data happens to occupy the same
-// way.
-wire ipred_seed_read = ((cst == C_LOOK) && look_hit && r_bank &&
-                       (r_addr[3:2] != 2'd3));
-wire ipred_idle_read = idle_hit && c_instr && (c_addr[3:2] != 2'd3);
-wire ipred_chain_read = ipred_hit && (c_addr[3:2] != 2'd3);
-wire ipred_read = ipred_seed_read || ipred_chain_read || ipred_idle_read;
-wire [5:0] ipred_read_set = ipred_seed_read ? r_row[5:0] : c_addr[9:4];
-wire [1:0] ipred_read_word = ipred_seed_read
-	? (r_addr[3:2] + 2'd1) : (c_addr[3:2] + 2'd1);
+// Any instruction hit that identified its way (a C_LOOK hit, or an idle
+// admission) reads that way's whole line on the same edge it acknowledges.
+wire iline_seed_read = (cst == C_LOOK) && look_hit && r_bank;
+wire iline_idle_read = idle_hit && c_instr;
+wire iline_read = iline_seed_read || iline_idle_read;
+wire [5:0] iline_read_set = iline_seed_read ? r_row[5:0] : c_addr[9:4];
 
-assign cd_rd_en  = (cst == C_IDLE) || rd_accept || store_lookup_accept || ipred_read;
-assign cd_ridx   = ipred_read ? {1'b1, ipred_read_set, ipred_read_word}
-                              : {c_instr, a_set, c_addr[3:2]};
+assign cd_rd_en  = (cst == C_IDLE) || rd_accept || store_lookup_accept || iline_read;
+// word-wise: array k at way (k - w); line-wise: every array at the hit way
+wire  [1:0] rd_w = c_addr[3:2];
+assign cd_ridx0  = iline_read ? {1'b1, iline_read_set, hit_way}
+                              : {c_instr, a_set, 2'd0 - rd_w};
+assign cd_ridx1  = iline_read ? {1'b1, iline_read_set, hit_way}
+                              : {c_instr, a_set, 2'd1 - rd_w};
+assign cd_ridx2  = iline_read ? {1'b1, iline_read_set, hit_way}
+                              : {c_instr, a_set, 2'd2 - rd_w};
+assign cd_ridx3  = iline_read ? {1'b1, iline_read_set, hit_way}
+                              : {c_instr, a_set, 2'd3 - rd_w};
 wire store_hit_write = (cst == C_PASS) && pass_store_chk && m_ack && look_hit;
-assign cd_we     = store_hit_write
-	                  ? (4'd1 << hit_way) :
-	                ((((cst == C_FILL) && r_issued && m_ack) || fill_line_write)
-	                  ? (4'd1 << r_way) : 4'd0);
-assign cd_widx   = {r_bank, r_row[5:0], r_beat};
+wire fill_beat_write = ((cst == C_FILL) && r_issued && m_ack) || fill_line_write;
+wire  [1:0] wr_way = store_hit_write ? hit_way : r_way;
+wire  [1:0] wr_arr = wr_way + r_beat;
+assign cd_we     = (store_hit_write || fill_beat_write) ? (4'd1 << wr_arr) : 4'd0;
+assign cd_widx   = {r_bank, r_row[5:0], wr_way};
 assign cd_wdat   = store_hit_write ? lw_merge(data_hit, r_wdata, r_size, r_off) :
 	                  (fill_line_write ? fill_line_word : m_rdata);
 
@@ -538,26 +572,31 @@ always @(posedge clk) begin
 		r_row <= 0; r_tag <= 0; r_word <= 0; r_way <= 0; r_bank <= 0;
 		r_beat <= 0; r_issued <= 0; r_addr <= 0; r_size <= 0; r_off <= 0;
 		fill_hold <= 0; r_wdata <= 0; pass_store_chk <= 0;
-		ipred_pending <= 0; ipred_valid <= 0; ipred_way <= 0;
-		ipred_addr <= 0; ipred_data <= 0;
+		iline_pending <= 0; iline_valid <= 0; iline_way <= 0;
+		iline_tag <= 0; iline_data <= 0; iline_stb <= 0; iline_stb_pend <= 0;
 		ack_r <= 0; rdata_r <= 0;
 	end
 	else if (ce) begin
 		ack_r <= 0;
 		cinv_done <= 0;
 		if (ci_inv) ci_inv_pend <= 0;
+		// The offer must follow the acknowledge by one cycle: the core takes
+		// its acknowledged words that cycle and cannot append more then.
+		iline_stb <= iline_stb_pend;
+		iline_stb_pend <= 0;
 
-		// The lookahead RAM read completed on the preceding edge.  Capture the
-		// selected way before any newly accepted request can reuse the RAM port.
-		if (ipred_pending) begin
-			case (ipred_way)
-				2'd0: ipred_data <= data_q0;
-				2'd1: ipred_data <= data_q1;
-				2'd2: ipred_data <= data_q2;
-				default: ipred_data <= data_q3;
+		// The line read completed on the preceding edge: array (way + w)
+		// holds word w.  Capture before any new request reuses the port.
+		if (iline_pending) begin
+			case (iline_way)
+				2'd0: iline_data <= {data_q0, data_q1, data_q2, data_q3};
+				2'd1: iline_data <= {data_q1, data_q2, data_q3, data_q0};
+				2'd2: iline_data <= {data_q2, data_q3, data_q0, data_q1};
+				default: iline_data <= {data_q3, data_q0, data_q1, data_q2};
 			endcase
-			ipred_pending <= 0;
-			ipred_valid <= 1;
+			iline_pending <= 0;
+			iline_valid <= 1;
+			iline_stb <= 1;
 		end
 
 		// A snoop displaced a store's first-set invalidate in its
@@ -579,23 +618,19 @@ always @(posedge clk) begin
 			C_IDLE: begin
 				if (!c_req) err_hold <= 0;
 				if (cinv_req && !cinv_done) begin
-					ipred_pending <= 0;
-					ipred_valid <= 0;
+					iline_pending <= 0;
+					iline_valid <= 0;
 					sweep_cnt <= 0;
 					sweep_all <= 0;   // honour the cinv_ic/cinv_dc selects
 					cst <= C_SWEEP;
 				end
-				else if (ipred_hit) begin
-					// Registered completion just like C_LOOK, but the word was
-					// read ahead while the previous hit acknowledged.
-					rdata_r <= lw_extract(ipred_data, c_size, c_addr[1:0]);
+				else if (iline_hit) begin
+					// Registered completion just like C_LOOK, from the
+					// buffered line; the buffer stays valid for the rest of
+					// the line (a loop inside one line keeps hitting here).
+					rdata_r <= lw_extract(iline_lw, c_size, c_addr[1:0]);
 					ack_r <= 1;
-					ipred_valid <= 0;
-					if (c_addr[3:2] != 2'd3) begin
-						ipred_pending <= 1;
-						ipred_addr <= c_addr[31:2] + 30'd1;
-						// ipred_way remains the known resident way.
-					end
+					iline_stb_pend <= 1;
 				end
 				else if (idle_hit) begin
 					// Identical registered response to C_LOOK, using the prior
@@ -603,13 +638,11 @@ always @(posedge clk) begin
 					rdata_r <= lw_extract(data_hit, c_size, c_addr[1:0]);
 					ack_r <= 1;
 					if (c_instr) begin
-						ipred_pending <= 0;
-						ipred_valid <= 0;
-						if (c_addr[3:2] != 2'd3) begin
-							ipred_pending <= 1;
-							ipred_way <= hit_way;
-							ipred_addr <= c_addr[31:2] + 30'd1;
-						end
+						// the line read runs in parallel (iline_idle_read)
+						iline_pending <= 1;
+						iline_valid <= 0;
+						iline_way <= hit_way;
+						iline_tag <= c_addr[31:4];
 					end
 				end
 				// A cache-inhibited hit owes a row invalidate.  Accept
@@ -652,8 +685,8 @@ always @(posedge clk) begin
 					// prediction unreachable.  Data traffic uses the independent
 					// D-cache bank and may safely pass between sequential fills.
 					if (c_instr) begin
-						ipred_pending <= 0;
-						ipred_valid <= 0;
+						iline_pending <= 0;
+						iline_valid <= 0;
 					end
 					if (c_write) begin
 						if (store_inv_lost) begin
@@ -772,11 +805,12 @@ always @(posedge clk) begin
 					// hit completes here: two cycles request-to-ack
 					rdata_r <= lw_extract(data_hit, r_size, r_off);
 					ack_r <= 1;
-					if (r_bank && r_addr[3:2] != 2'd3) begin
-						ipred_pending <= 1;
-						ipred_valid <= 0;
-						ipred_way <= hit_way;
-						ipred_addr <= r_addr[31:2] + 30'd1;
+					if (r_bank) begin
+						// the line read runs in parallel (iline_seed_read)
+						iline_pending <= 1;
+						iline_valid <= 0;
+						iline_way <= hit_way;
+						iline_tag <= r_addr[31:4];
 					end
 					cst <= C_IDLE;
 				end

@@ -53,6 +53,11 @@ module ap040_core
 	input             mem_ack,
 	input      [31:0] mem_rdata,
 	input             mem_flt,     // access error pulse from the MMU
+	// Instruction line sideband from the cache (see ap040_cache): the whole
+	// line of the last acknowledged instruction hit, one cycle later.
+	input             mem_line_stb,
+	input      [31:4] mem_line_tag,
+	input     [127:0] mem_line_data,
 
 	// MMU control register values and PTEST/PFLUSH sideband
 	output     [31:0] tc_out,
@@ -617,6 +622,13 @@ reg        epf_pend_lw;          // ... and it returns two words
 reg        epf_kill;             // ... whose data a flush has abandoned
 reg        epf_err;              // the fill engine faulted: re-issue on demand
 reg        epf_brf;              // queue was seeded by branch-refill buffer
+reg        epf_pend_seed;         // ... the outstanding fetch is a redirect's own
+reg        brf_seed_ok;           // the last acknowledged fetch was a redirect's
+// The cache identifies its offered line physically; the queue and the
+// refill buffer are logical.  Record the logical line and context of every
+// acknowledged instruction fetch: the offer that follows is that line.
+reg [31:4] iline_log;
+reg        iline_super;
 
 // Small instruction branch-refill buffer.  The main queue is forward-only:
 // a taken backwards branch otherwise discards its words and pays another
@@ -639,7 +651,7 @@ reg [15:0] brf_valid;
 reg        epf_issue;            // the port was claimed by a state this cycle
 reg        epf_flushed;          // the queue was flushed this cycle
 reg  [1:0] epf_pop;              // words consumed this cycle
-reg  [1:0] epf_fillw;            // words appended this cycle
+reg  [3:0] epf_fillw;            // words appended this cycle (up to a line)
 // Blocking per-clock carrier: only fetch_next's qualified resident-opcode
 // branch sets this. Descriptor controls are written once after case(state),
 // rather than expanded inside every caller of the generic completion task.
@@ -1476,6 +1488,7 @@ task issue_ifetch;
 				fc_r <= s ? `AP040_FC_SUPER_PROG : `AP040_FC_USER_PROG;
 				epf_pend <= 1;
 				epf_pend_lw <= ~a[1];
+				epf_pend_seed <= 1;
 				epf_kill <= 0;
 				epf_issue = 1;
 			end
@@ -1670,11 +1683,38 @@ task ea_operand_start;
 	input [2:0] rn;
 	input [1:0] size;
 	input [7:0] ret;
+	reg ext_inline;
 	begin
 		ea_start(mode, rn, size, ret);
+		// From S_PIPE_START, with the base register already on port A and
+		// the extension word resident in the queue, consume it here instead
+		// of spending S_IMMF on the same pop.  Same guards as the decode-time
+		// inline; a pending register/stack write keeps the old path so the
+		// base captured below is never stale.
+		ext_inline = (state == S_PIPE_START) && !epf_flushed && !epf_pend &&
+		             !mem_ack && epf_ready_pc && (rr_a == {1'b1, rn}) &&
+		             !rf_we && !aux_we;
 		case (mode)
-			3'b101: immf(2'd1, S_EA_D16);
-			3'b110: immf(2'd1, S_EA_EXTW);
+			3'b101:
+				if (ext_inline) begin
+					imm <= {16'd0, epf_data[epf_head]};
+					pc <= pc + 32'd2;
+					epf_pop = 2'd1;
+					epf_issue = 1;
+					state <= S_EA_D16;
+				end
+				else immf(2'd1, S_EA_D16);
+			3'b110:
+				if (ext_inline) begin
+					extw <= epf_data[epf_head];
+					rr_b <= epf_data[epf_head][15:12];
+					ea_base_v <= rf_rdata_a;
+					pc <= pc + 32'd2;
+					epf_pop = 2'd1;
+					epf_issue = 1;
+					state <= S_EA_EXTW2;
+				end
+				else immf(2'd1, S_EA_EXTW);
 			3'b111: begin
 				case (rn)
 					3'b000: begin ea_absl <= 0; immf(2'd1, S_EA_ABS); end
@@ -2183,11 +2223,33 @@ endtask
 // Bcc calculates and validates its target even when the condition is false.
 // The 68040 therefore takes an address error for an odd target on a
 // not-taken conditional branch as well as on a taken one.
+function brf_refill_hit;
+	input [31:0] a;
+	begin
+		brf_refill_hit = (brf_tag == a[31:5]) && (brf_super == sr_s) &&
+		                 (a[4:1] <= 4'd12) &&
+		                 brf_valid[a[4:1]] && brf_valid[a[4:1] + 4'd1] &&
+		                 brf_valid[a[4:1] + 4'd2] && brf_valid[a[4:1] + 4'd3];
+	end
+endfunction
+
 task finish_bcc;
 	input [31:0] t;
 	input        taken;
 	begin
 		if (t[0]) exc(`AP040_VEC_ADDRERR, 4'd2, pc_i, {t[31:1], 1'b0});
+		// A taken branch whose target window sits in the refill buffer
+		// dispatches its target directly, as DBcc does, instead of
+		// spending S_FETCH on a word the buffer already holds.  Only the
+		// ordinary idle-bus case; traces and interrupts keep go_pc's order.
+		// An outstanding speculative queue fetch does not block this: the
+		// buffer supplies the target words and issue_ifetch marks that
+		// fetch killed, so its later acknowledge appends nothing.  Only the
+		// acknowledge cycle itself is excluded (its append shares the ring).
+		else if (taken && !tr_t1 && !tr_t0 && !irq_pend &&
+		         brf_refill_hit(t) && !mem_ack &&
+		         (!epf_armed || epf_next != t || epf_super != sr_s))
+			decode_dbcc_brf(t);
 		else if (taken) go_pc(t);
 		else fetch_next;
 	end
@@ -2252,7 +2314,7 @@ always @(posedge clk) begin
 	epf_issue   = 0;
 	epf_flushed = 0;
 	epf_pop     = 2'd0;
-	epf_fillw   = 2'd0;
+	epf_fillw   = 4'd0;
 	rd_queue_pop = 0;
 
 	if (!nreset) begin
@@ -2314,6 +2376,7 @@ always @(posedge clk) begin
 		epf_count <= 0; epf_head <= 0; epf_fill <= 0;
 		epf_base <= 0; epf_next <= 0; epf_super <= 0;
 		epf_ftail <= 0; epf_armed <= 0; epf_pend <= 0;
+		epf_pend_seed <= 0; brf_seed_ok <= 0; iline_log <= 0; iline_super <= 0;
 		epf_pend_lw <= 0; epf_kill <= 0; epf_err <= 0; epf_brf <= 0;
 		// Queue/refill payload is invalid while the count/valid controls below
 		// are clear.  Do not reset it: payload reset muxes only consume FPGA
@@ -2386,6 +2449,61 @@ always @(posedge clk) begin
 		fpu_frestore_idle <= 0;
 		fpu_frestore_unimp <= 0;
 		if (mem_ack) mem_req <= 0;
+		// Every acknowledged instruction fetch, whether the queue engine's,
+		// a redirect's or the exception prefetch's own, names the line the
+		// cache will offer next cycle: record it and its context here, not
+		// on any one issuer's path.  Only a queue fetch that was neither
+		// killed nor flushed may let the offer replace the refill sector.
+		if (i_ack) begin
+			iline_log <= mem_addr_q[31:4];
+			iline_super <= fc_r[2];
+			brf_seed_ok <= epf_pend ? (epf_pend_seed && !epf_kill && !epf_flushed)
+			                        : 1'b1;
+		end
+
+		//-------------------------------------------------- line sideband
+		// The cache offers the whole line of the last instruction hit one
+		// cycle after acknowledging it.  Take every word from the fill tail
+		// to the end of the line that fits in the ring, so the stream runs
+		// ahead by up to eight words without another bus request.  This
+		// runs BEFORE the state case and uses registered state only: the
+		// word count must not hang off this cycle's pop/flush decisions
+		// (that path ran through the ALU and missed timing by 7 ns).  A
+		// flush or a redirect's own seed later in this cycle overrides the
+		// ring writes by nonblocking order, and the merged bookkeeping below
+		// drops the count/tail advance when epf_flushed is set.  Refused
+		// while a queue fetch is outstanding or being acknowledged (its
+		// return appends the same words) and when the tail is not in the
+		// offered line.  The line also seeds the branch-refill sector
+		// buffer; a same-cycle CPU-write invalidation below wins over it.
+		if (mem_line_stb && epf_armed && !epf_pend && !mem_ack &&
+		    (epf_super == iline_super)) begin : line_offer
+			reg [3:0] avail, room, n;
+			integer i;
+			brf_seed_ok <= 0;
+			if (epf_ftail[31:4] == iline_log) begin
+				avail = 4'd8 - {1'b0, epf_ftail[3:1]};
+				room  = 4'd8 - epf_count;
+				n = (avail < room) ? avail : room;
+				for (i = 0; i < 8; i = i + 1)
+					if (i < n)
+						epf_data[epf_fill + i[2:0]] <=
+							mem_line_data[(127 - 16 * (epf_ftail[3:1] + i[2:0])) -: 16];
+				epf_fillw = n;
+				epf_issue = 1;
+			end
+			if ((brf_tag == iline_log[31:5] && brf_super == epf_super) ||
+			    brf_seed_ok) begin
+				for (i = 0; i < 4; i = i + 1)
+					brf_data[{iline_log[4], i[1:0]}] <= mem_line_data[(127 - 32 * i) -: 32];
+				if (brf_tag == iline_log[31:5] && brf_super == epf_super)
+					brf_valid <= brf_valid | (16'h00FF << {iline_log[4], 3'd0});
+				else
+					brf_valid <= 16'h00FF << {iline_log[4], 3'd0};
+				brf_tag <= iline_log[31:5];
+				brf_super <= epf_super;
+			end
+		end
 
 		// A completing CPU write that lands inside the fetch queue's
 		// window [epf_next, epf_ftail) flushes it, so the rewritten
@@ -2400,6 +2518,12 @@ always @(posedge clk) begin
 		if (d_ack && mem_write && epf_armed && epf_count != 4'd0 &&
 		    (mem_addr_q + 32'd3 >= epf_next) && (mem_addr_q < epf_ftail))
 			epf_flush;
+		// The refill buffer now outlives the fetch window (it keeps the last
+		// redirect's sector), so a CPU write into that sector invalidates
+		// it directly: the same stale-prefetch hazard, one buffer further.
+		if (d_ack && mem_write &&
+		    ((mem_addr_q[31:5] == brf_tag) || ((mem_addr_q + 32'd3) >> 5 == brf_tag)))
+			brf_valid <= 0;
 
 		case (state)
 			//------------------------------------------------------------ boot
@@ -2724,7 +2848,11 @@ always @(posedge clk) begin
 					else aerr_start;
 				end
 				else if (d_ack) begin
-					state <= r_m_ret;
+					// A completed store with nothing left to do retires
+					// straight into the next opcode, as a completed operand
+					// read does through retire_operand_alu.
+					if (r_m_ret == S_NEXT) fetch_next;
+					else state <= r_m_ret;
 				end
 			end
 
@@ -2890,12 +3018,19 @@ always @(posedge clk) begin
 						if (p_dst == DK_REG) begin
 							rr_b <= p_dreg; state <= S_PIPE_REGS;
 						end
+						else if (p_dst == DK_MEM)
+							ea_operand_start(dst_mode_r, dst_rn_r, p_dsize, S_PIPE_DEA);
 						else state <= S_PIPE_DST;
 					end
 					default:
 						if (p_dst == DK_REG) begin
 							rr_b <= p_dreg; state <= S_PIPE_REGS;
 						end
+						// A memory destination with no source operand starts
+						// its EA here instead of spending S_PIPE_DST on the
+						// same dispatch (and S_EA_DISP on extension modes).
+						else if (p_dst == DK_MEM)
+							ea_operand_start(dst_mode_r, dst_rn_r, p_dsize, S_PIPE_DEA);
 						else state <= S_PIPE_DST;
 				endcase
 			end
@@ -6514,29 +6649,39 @@ always @(posedge clk) begin
 				if (epf_pend_lw) begin
 					epf_data[epf_fill]        <= mem_rdata[31:16];
 					epf_data[epf_fill + 3'd1] <= mem_rdata[15:0];
-					epf_fillw = 2'd2;
+					epf_fillw = 4'd2;
 				end
 				else begin
 					epf_data[epf_fill] <= mem_rdata[15:0];
-					epf_fillw = 2'd1;
+					epf_fillw = 4'd1;
 				end
 				// A longword instruction fetch is naturally aligned and never
-				// crosses a 32-byte sector, so both returned words update one entry.
-				if (epf_pend_lw)
-					brf_data[mem_addr_q[4:2]] <= mem_rdata;
-				else if (mem_addr_q[1])
-					brf_data[mem_addr_q[4:2]][15:0] <= mem_rdata[15:0];
-				else
-					brf_data[mem_addr_q[4:2]][31:16] <= mem_rdata[15:0];
-				if (brf_tag == mem_addr_q[31:5] && brf_super == epf_super) begin
-					brf_valid[mem_addr_q[4:1]] <= 1;
-					if (epf_pend_lw) brf_valid[mem_addr_q[4:1] + 4'd1] <= 1;
+				// crosses a 32-byte sector, so both returned words update one
+				// entry.  The buffer keeps the sector of the last redirect: a
+				// speculative fill that runs past a loop's end must not evict
+				// the loop it will branch back into, and must not touch the
+				// buffer's data either, or stale valid bits would describe
+				// words from another sector.
+				if ((brf_tag == mem_addr_q[31:5] && brf_super == epf_super) ||
+				    epf_pend_seed) begin
+					if (epf_pend_lw)
+						brf_data[mem_addr_q[4:2]] <= mem_rdata;
+					else if (mem_addr_q[1])
+						brf_data[mem_addr_q[4:2]][15:0] <= mem_rdata[15:0];
+					else
+						brf_data[mem_addr_q[4:2]][31:16] <= mem_rdata[15:0];
+					if (brf_tag == mem_addr_q[31:5] && brf_super == epf_super) begin
+						brf_valid[mem_addr_q[4:1]] <= 1;
+						if (epf_pend_lw) brf_valid[mem_addr_q[4:1] + 4'd1] <= 1;
+					end
+					else begin
+						brf_valid <= (epf_pend_lw ? 16'b0000_0000_0000_0011
+						                          : 16'b0000_0000_0000_0001)
+						                  << mem_addr_q[4:1];
+						brf_tag <= mem_addr_q[31:5];
+						brf_super <= epf_super;
+					end
 				end
-				else brf_valid <= (epf_pend_lw ? 16'b0000_0000_0000_0011
-				                               : 16'b0000_0000_0000_0001)
-				                       << mem_addr_q[4:1];
-				brf_tag <= mem_addr_q[31:5];
-				brf_super <= epf_super;
 			end
 		end
 		else if (epf_pend && i_err) begin
@@ -6578,9 +6723,11 @@ always @(posedge clk) begin
 		// consumed, and those fetches precede the locked read.  This also
 		// keeps a stale lk_cyc after a faulted CAS from starving the
 		// handler's first instruction.
+		// A queue seeded from the branch-refill buffer used to refuse
+		// speculative filling until it ran dry; with the cache returning
+		// whole lines, one fetch of the continuation brings the rest of
+		// the loop, so the stream fills like any other.
 		else if (epf_armed && !epf_pend && !epf_err &&
-		         (!epf_brf || (epf_count == 4'd0 &&
-		                       (state == S_FETCH || state == S_IMMF))) &&
 		         !epf_issue && !epf_flushed &&
 		         !mem_req && !mem_ack &&
 		         (!lk_cyc || state == S_IMMF) &&
@@ -6600,6 +6747,7 @@ always @(posedge clk) begin
 		         (epf_ftail[1] ? (epf_count <= 4'd7) : (epf_count <= 4'd6)))
 		begin
 			epf_brf <= 0;
+			epf_pend_seed <= 0;
 			mem_req <= 1; mem_write <= 0; mem_instr_q <= 1;
 			mem_size <= epf_ftail[1] ? `AP040_SZ_W : `AP040_SZ_L;
 			mem_addr_q <= epf_ftail;
@@ -6612,15 +6760,15 @@ always @(posedge clk) begin
 		// Queue bookkeeping in one place, so that a pop and an append in the
 		// same cycle cannot lose each other's update.  A flush has already
 		// written the whole set and wins.
-		if (!epf_flushed && (epf_pop != 2'd0 || epf_fillw != 2'd0)) begin
-			epf_count <= epf_count + {2'd0, epf_fillw} - {2'd0, epf_pop};
+		if (!epf_flushed && (epf_pop != 2'd0 || epf_fillw != 4'd0)) begin
+			epf_count <= epf_count + epf_fillw - {2'd0, epf_pop};
 			if (epf_pop != 2'd0) begin
 				epf_head <= epf_head + {1'b0, epf_pop};
 				epf_next <= epf_next + {29'd0, epf_pop, 1'b0};
 			end
-			if (epf_fillw != 2'd0) begin
-				epf_fill  <= epf_fill + {1'b0, epf_fillw};
-				epf_ftail <= epf_ftail + {29'd0, epf_fillw, 1'b0};
+			if (epf_fillw != 4'd0) begin
+				epf_fill  <= epf_fill + epf_fillw[2:0];
+				epf_ftail <= epf_ftail + {27'd0, epf_fillw, 1'b0};
 			end
 		end
 	end
