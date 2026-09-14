@@ -179,7 +179,7 @@ wire hit3 = lk_fresh && atc_v[{l_row, 2'd3}] && (a_w3[44:28] == l_tag);
 wire pipe_hit = hit0 | hit1 | hit2 | hit3;
 wire [EW-1:0] pipe_ent = hit0 ? a_w0 : hit1 ? a_w1 : hit2 ? a_w2 : a_w3;
 
-// One-entry copy of the most recent piped ATC hit.  A request whose
+// Per-space copies of the most recent piped ATC hit.  A request whose
 // {row, tag} equals it translates in its own request cycle instead of
 // waiting for the one-clock lookup pipe; sequential fetches and most data
 // traffic stay in one page for long stretches.  The copy is dropped on
@@ -187,27 +187,31 @@ wire [EW-1:0] pipe_ent = hit0 ? a_w0 : hit1 ? a_w1 : hit2 ? a_w2 : a_w3;
 // and on reset, so it can never disagree with the array it mirrors.  It
 // carries no state of its own: permissions, cache mode and the M bit come
 // from the copied entry and go through the same fault/walk decisions.
-reg          u_valid;
-reg    [4:0] u_row;
-reg   [16:0] u_tag;
-reg [EW-1:0] u_ent;
+reg          u_valid [0:1];   // one copy per space: instruction, data
+reg    [4:0] u_row   [0:1];
+reg   [16:0] u_tag   [0:1];
+reg [EW-1:0] u_ent   [0:1];
 reg   [31:0] u_tc;
+integer      ui;
 always @(posedge clk) begin
 	u_tc <= tc;
-	if (!nreset || fill_we || sweep_on || pf_req || (tc != u_tc))
-		u_valid <= 0;
+	if (!nreset || fill_we || sweep_on || pf_req || (tc != u_tc)) begin
+		for (ui = 0; ui < 2; ui = ui + 1) u_valid[ui] <= 0;
+	end
 	else if (pipe_hit) begin
-		u_valid <= 1;
-		u_row   <= l_row;
-		u_tag   <= l_tag;
-		u_ent   <= pipe_ent;
+		u_valid[l_row[4]] <= 1;
+		u_row[l_row[4]]   <= l_row;
+		u_tag[l_row[4]]   <= l_tag;
+		u_ent[l_row[4]]   <= pipe_ent;
 	end
 end
-wire u_hit = u_valid && (u_row == a_row) && (u_tag == a_tag);
+wire u_hit = u_valid[c_instr] && (u_row[c_instr] == a_row) &&
+             (u_tag[c_instr] == a_tag);
+wire [EW-1:0] u_sel = u_ent[c_instr];
 
 wire atc_hit = u_hit | pipe_hit;
 
-wire [EW-1:0] h_ent = u_hit ? u_ent : pipe_ent;
+wire [EW-1:0] h_ent = u_hit ? u_sel : pipe_ent;
 wire [19:0] h_pa   = h_ent[27:8];
 wire  [7:0] h_attr = h_ent[7:0];
 wire        h_s    = h_attr[4];

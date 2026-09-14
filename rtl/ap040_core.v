@@ -45,9 +45,9 @@ module ap040_core
 	// internal memory transaction to ap040_bus16_adapter
 	output reg        mem_req,
 	output reg        mem_write,
-	output reg        mem_instr,
+	output            mem_instr,
 	output reg  [1:0] mem_size,
-	output reg [31:0] mem_addr,
+	output     [31:0] mem_addr,
 	output reg [31:0] mem_wdata,
 	output      [2:0] mem_fc,
 	input             mem_ack,
@@ -227,7 +227,7 @@ wire unused_in = ipl_autovector;
 // while a transfer is outstanding, which is the only time they are tested.
 wire mem_err = mem_req && (mem_flt | berr);
 
-// X2.2b stage 1: the memory port carries two channels, and mem_instr tags
+// X2.2b stage 1: the memory port carries two channels, and mem_instr_q tags
 // which one owns the transaction in flight -- aerr_start already builds the
 // fault frame from it.  What was NOT explicit is the acknowledge: a data
 // state reaches its ack branch only when m_issued, and m_issued can only be
@@ -239,13 +239,13 @@ wire mem_err = mem_req && (mem_flt | berr);
 // later is not also the change that introduces the qualification.
 //
 // Behaviour is identical today: epf_pend is set only by instruction issues
-// (issue_ifetch's port-free branch and the fill engine, both mem_instr=1),
+// (issue_ifetch's port-free branch and the fill engine, both mem_instr_q=1),
 // exception_prefetch owns the port outright on the exception path, and the
-// data states set mem_instr=0 at their own issue.
-wire d_ack = mem_ack && !mem_instr;   // data channel acknowledge
-wire i_ack = mem_ack &&  mem_instr;   // instruction channel acknowledge
-wire d_err = mem_err && !mem_instr;
-wire i_err = mem_err &&  mem_instr;
+// data states set mem_instr_q=0 at their own issue.
+wire d_ack = mem_ack && !mem_instr_q;   // data channel acknowledge
+wire i_ack = mem_ack &&  mem_instr_q;   // instruction channel acknowledge
+wire d_err = mem_err && !mem_instr_q;
+wire i_err = mem_err &&  mem_instr_q;
 
 //---------------------------------------------------------------------------
 // register file
@@ -655,13 +655,28 @@ wire       epf_ready_pc2 = epf_armed && (epf_count > 4'd1) &&
 // queue dry still completes in the acknowledge cycle, exactly as the
 // pre-queue demand fetch did.
 wire       epf_fwd_pc = epf_pend && i_ack && !epf_kill && epf_armed &&
-                        (epf_count == 4'd0) && (epf_next == mem_addr) &&
+                        (epf_count == 4'd0) && (epf_next == mem_addr_q) &&
                         (epf_next == pc) && (epf_super == sr_s);
 wire [15:0] epf_fwd_word = epf_pend_lw ? mem_rdata[31:16] : mem_rdata[15:0];
 
 reg        m_wr;
 reg  [1:0] m_size;
 reg [31:0] m_addr_r, m_wdat, m_val;
+
+// Registered request address and space.  While no request is in flight the
+// output pins carry a HINT instead: the address the core is most likely to
+// request next.  The cache reads its index-addressed RAMs every idle cycle,
+// so a hint that turns out right lets the following request complete at its
+// admission edge; a wrong hint costs nothing, because the cache trusts only
+// its own index/validity record and a fresh tag compare, never the hint.
+// Nothing downstream may act on c_addr without c_req, and nothing in this
+// module reads the pins: every internal consumer uses the registered copies.
+//   S_MRD before issue     : the operand address the next cycle requests
+//   S_DECODE of a short Bcc: its target, requested by finish_bcc this cycle
+//   operand pipeline states: the source/destination address about to issue
+//   otherwise              : the fill engine's next sequential fetch
+reg [31:0] mem_addr_q;
+reg        mem_instr_q;
 
 reg  [2:0] ea_mode;
 reg  [2:0] ea_rn;
@@ -1455,9 +1470,9 @@ task issue_ifetch;
 				// page, so it cannot translate or fault differently than the
 				// two halves would have (the exception prefetch below stays
 				// word-wise precisely because its $FFE entry CAN span).
-				mem_req <= 1; mem_write <= 0; mem_instr <= 1;
+				mem_req <= 1; mem_write <= 0; mem_instr_q <= 1;
 				mem_size <= a[1] ? `AP040_SZ_W : `AP040_SZ_L;
-				mem_addr <= a;
+				mem_addr_q <= a;
 				fc_r <= s ? `AP040_FC_SUPER_PROG : `AP040_FC_USER_PROG;
 				epf_pend <= 1;
 				epf_pend_lw <= ~a[1];
@@ -1482,8 +1497,8 @@ task exception_prefetch;
 		epf_super <= s;
 		pc <= a;
 		pc_i <= a;
-		mem_req <= 1; mem_write <= 0; mem_instr <= 1;
-		mem_size <= `AP040_SZ_W; mem_addr <= a;
+		mem_req <= 1; mem_write <= 0; mem_instr_q <= 1;
+		mem_size <= `AP040_SZ_W; mem_addr_q <= a;
 		fc_r <= s ? `AP040_FC_SUPER_PROG : `AP040_FC_USER_PROG;
 		epf_issue = 1;
 		state <= S_EPF_FILL;
@@ -1590,8 +1605,8 @@ task mrd;
 		    ((size == `AP040_SZ_B) ||
 		     ((size == `AP040_SZ_W) && !a[0]) ||
 		     ((size == `AP040_SZ_L) && !(|a[1:0])))) begin
-			mem_req <= 1; mem_write <= 0; mem_instr <= 0;
-			mem_size <= size; mem_addr <= a;
+			mem_req <= 1; mem_write <= 0; mem_instr_q <= 0;
+			mem_size <= size; mem_addr_q <= a;
 			fc_r <= fc_ovr_v ? fc_ovr :
 			        (sr_s ? `AP040_FC_SUPER_DATA : `AP040_FC_USER_DATA);
 			m_issued <= 1;
@@ -1618,8 +1633,8 @@ task mwr;
 		    ((size == `AP040_SZ_B) ||
 		     ((size == `AP040_SZ_W) && !a[0]) ||
 		     ((size == `AP040_SZ_L) && !(|a[1:0])))) begin
-			mem_req <= 1; mem_write <= 1; mem_instr <= 0;
-			mem_size <= size; mem_addr <= a; mem_wdata <= d;
+			mem_req <= 1; mem_write <= 1; mem_instr_q <= 0;
+			mem_size <= size; mem_addr_q <= a; mem_wdata <= d;
 			fc_r <= fc_ovr_v ? fc_ovr :
 			        (sr_s ? `AP040_FC_SUPER_DATA : `AP040_FC_USER_DATA);
 			m_issued <= 1;
@@ -1759,14 +1774,14 @@ task aerr_start;
 		aer_bus  <= berr && !mem_flt;   // physical bus error, not an ATC fault
 		// FA is the initial byte of the original transfer, even when a
 		// page-crossing access has been split and a later byte faults.
-		aer_fa   <= mem_instr ? mem_addr : m_addr_r;
+		aer_fa   <= mem_instr_q ? mem_addr_q : m_addr_r;
 		aer_wr   <= mem_write;
-		aer_sz   <= (!mem_instr && m_cross) ? m_size : mem_size;
-		aer_wd   <= (!mem_instr && m_cross) ? m_wdat : mem_wdata;
+		aer_sz   <= (!mem_instr_q && m_cross) ? m_size : mem_size;
+		aer_wd   <= (!mem_instr_q && m_cross) ? m_wdat : mem_wdata;
 		aer_lk   <= lk_cyc;
 		// memory ops wait in S_MRD/S_MWR: the requesting context is
 		// identified by the continuation state, not by `state` itself
-		aer_m16  <= !mem_instr &&
+		aer_m16  <= !mem_instr_q &&
 		            (r_m_ret >= S_M16_RD2 && r_m_ret <= S_M16_INC2);
 		// MOVES faults report the alternate space in TT/TM: FC 0, 3, 4 and 7
 		// keep the raw FC with TT = 10; FC 2 and 6 are remapped onto the
@@ -1775,8 +1790,8 @@ task aerr_start;
 		            ? 2'b10 : 2'b00;
 		aer_tm   <= (fc_ovr_v && (fc_r[1:0] == 2'b00 || fc_r[1:0] == 2'b11)) ? fc_r :
 		            (fc_ovr_v && fc_r[1]) ? {fc_r[2], 2'b01} : fc_r;
-		aer_ma   <= mem_flt && !mem_instr && m_cross &&
-		            ((mem_addr & ~m_pgmask) != (m_addr_r & ~m_pgmask));
+		aer_ma   <= mem_flt && !mem_instr_q && m_cross &&
+		            ((mem_addr_q & ~m_pgmask) != (m_addr_r & ~m_pgmask));
 		// Preserve fc_r above for the SSW, then force all frame/vector cycles
 		// back to supervisor data space.
 		fc_ovr_v <= 0;
@@ -2206,6 +2221,26 @@ task pipe_go_regdst;
 	end
 endtask
 
+wire        hint_data = (state == S_MRD) && !m_issued;
+wire        hint_bcc  = (state == S_DECODE) && (ir[15:12] == 4'h6) &&
+                        (ir[11:8] != 4'h1) &&
+                        (ir[7:0] != 8'h00) && (ir[7:0] != 8'hFF);
+// The operand pipeline's own reads (the mrd sites in S_PIPE_START,
+// S_PIPE_SRD and S_PIPE_DEA) issue at the end of those states from the
+// same values shown here, so the hint precedes each by exactly one cycle.
+wire        hint_pipe = (state == S_PIPE_START) && (p_src == SK_MEM);
+wire [31:0] hint_pipe_addr = (src_mode_r == 3'b100)
+                           ? rf_rdata_a - an_adj(src_rn_r, p_ssize)
+                           : rf_rdata_a;
+wire        hint_ea   = (state == S_PIPE_SRD) ||
+                        ((state == S_PIPE_DEA) && p_rmw);
+wire [31:0] hint_addr = hint_data ? m_addr_r :
+                        hint_bcc  ? (pc + sxb(ir[7:0])) :
+                        hint_pipe ? hint_pipe_addr :
+                        hint_ea   ? ea_addr : epf_ftail;
+assign mem_addr  = mem_req ? mem_addr_q  : hint_addr;
+assign mem_instr = mem_req ? mem_instr_q : !(hint_data || hint_pipe || hint_ea);
+
 //---------------------------------------------------------------------------
 // main state machine
 //---------------------------------------------------------------------------
@@ -2243,8 +2278,8 @@ always @(posedge clk) begin
 		mmu_reset_seen <= 1;
 		ir <= 0;
 		perf_dispatch_toggle <= 0;
-		mem_req <= 0; mem_write <= 0; mem_instr <= 0;
-		mem_size <= `AP040_SZ_W; mem_addr <= 0; mem_wdata <= 0;
+		mem_req <= 0; mem_write <= 0; mem_instr_q <= 0;
+		mem_size <= `AP040_SZ_W; mem_addr_q <= 0; mem_wdata <= 0;
 		fc_r <= `AP040_FC_SUPER_DATA;
 		rf_we <= 0; rf_waddr <= 0; rf_wdata <= 0;
 		fpu_req <= 0; fpu_class <= 0; fpu_opm <= 0; fpu_fmt <= 0;
@@ -2363,7 +2398,7 @@ always @(posedge clk) begin
 		// Both ranges are logical addresses; ftail never wraps past the
 		// page guard, so the plain compares suffice.
 		if (d_ack && mem_write && epf_armed && epf_count != 4'd0 &&
-		    (mem_addr + 32'd3 >= epf_next) && (mem_addr < epf_ftail))
+		    (mem_addr_q + 32'd3 >= epf_next) && (mem_addr_q < epf_ftail))
 			epf_flush;
 
 		case (state)
@@ -2419,9 +2454,9 @@ always @(posedge clk) begin
 			// words.  Changing an address while req remains asserted can make a
 			// completed request look like a duplicate transaction.
 			S_EPF_GAP: begin
-				mem_req <= 1; mem_write <= 0; mem_instr <= 1;
+				mem_req <= 1; mem_write <= 0; mem_instr_q <= 1;
 				mem_size <= `AP040_SZ_W;
-				mem_addr <= epf_base + {28'd0, epf_fill, 1'b0};
+				mem_addr_q <= epf_base + {28'd0, epf_fill, 1'b0};
 				fc_r <= epf_super ? `AP040_FC_SUPER_PROG : `AP040_FC_USER_PROG;
 				state <= S_EPF_FILL;
 			end
@@ -2506,9 +2541,9 @@ always @(posedge clk) begin
 				if (!m_issued && epf_pend) begin
 				end
 				else if (!m_issued) begin
-					mem_req <= 1; mem_write <= 0; mem_instr <= 0;
+					mem_req <= 1; mem_write <= 0; mem_instr_q <= 0;
 					mem_size <= `AP040_SZ_B;
-					mem_addr <= m_addr_r + {29'd0, m_bidx};
+					mem_addr_q <= m_addr_r + {29'd0, m_bidx};
 					fc_r <= fc_ovr_v ? fc_ovr :
 					        (sr_s ? `AP040_FC_SUPER_DATA : `AP040_FC_USER_DATA);
 					m_issued <= 1;
@@ -2549,9 +2584,9 @@ always @(posedge clk) begin
 						endcase
 						default: byv = m_wdat[7:0];
 					endcase
-					mem_req <= 1; mem_write <= 1; mem_instr <= 0;
+					mem_req <= 1; mem_write <= 1; mem_instr_q <= 0;
 					mem_size <= `AP040_SZ_B;
-					mem_addr <= m_addr_r + {29'd0, m_bidx};
+					mem_addr_q <= m_addr_r + {29'd0, m_bidx};
 					mem_wdata <= {24'd0, byv};
 					fc_r <= fc_ovr_v ? fc_ovr :
 					        (sr_s ? `AP040_FC_SUPER_DATA : `AP040_FC_USER_DATA);
@@ -2634,8 +2669,8 @@ always @(posedge clk) begin
 					state <= S_MRD_B;
 				end
 				else if (!m_issued) begin
-					mem_req <= 1; mem_write <= 0; mem_instr <= 0;
-					mem_size <= m_size; mem_addr <= m_addr_r;
+					mem_req <= 1; mem_write <= 0; mem_instr_q <= 0;
+					mem_size <= m_size; mem_addr_q <= m_addr_r;
 					fc_r <= fc_ovr_v ? fc_ovr :
 					        (sr_s ? `AP040_FC_SUPER_DATA : `AP040_FC_USER_DATA);
 					m_issued <= 1;
@@ -2677,8 +2712,8 @@ always @(posedge clk) begin
 					state <= S_MWR_B;
 				end
 				else if (!m_issued) begin
-					mem_req <= 1; mem_write <= 1; mem_instr <= 0;
-					mem_size <= m_size; mem_addr <= m_addr_r;
+					mem_req <= 1; mem_write <= 1; mem_instr_q <= 0;
+					mem_size <= m_size; mem_addr_q <= m_addr_r;
 					mem_wdata <= m_wdat;
 					fc_r <= fc_ovr_v ? fc_ovr :
 					        (sr_s ? `AP040_FC_SUPER_DATA : `AP040_FC_USER_DATA);
@@ -6488,19 +6523,19 @@ always @(posedge clk) begin
 				// A longword instruction fetch is naturally aligned and never
 				// crosses a 32-byte sector, so both returned words update one entry.
 				if (epf_pend_lw)
-					brf_data[mem_addr[4:2]] <= mem_rdata;
-				else if (mem_addr[1])
-					brf_data[mem_addr[4:2]][15:0] <= mem_rdata[15:0];
+					brf_data[mem_addr_q[4:2]] <= mem_rdata;
+				else if (mem_addr_q[1])
+					brf_data[mem_addr_q[4:2]][15:0] <= mem_rdata[15:0];
 				else
-					brf_data[mem_addr[4:2]][31:16] <= mem_rdata[15:0];
-				if (brf_tag == mem_addr[31:5] && brf_super == epf_super) begin
-					brf_valid[mem_addr[4:1]] <= 1;
-					if (epf_pend_lw) brf_valid[mem_addr[4:1] + 4'd1] <= 1;
+					brf_data[mem_addr_q[4:2]][31:16] <= mem_rdata[15:0];
+				if (brf_tag == mem_addr_q[31:5] && brf_super == epf_super) begin
+					brf_valid[mem_addr_q[4:1]] <= 1;
+					if (epf_pend_lw) brf_valid[mem_addr_q[4:1] + 4'd1] <= 1;
 				end
 				else brf_valid <= (epf_pend_lw ? 16'b0000_0000_0000_0011
 				                               : 16'b0000_0000_0000_0001)
-				                       << mem_addr[4:1];
-				brf_tag <= mem_addr[31:5];
+				                       << mem_addr_q[4:1];
+				brf_tag <= mem_addr_q[31:5];
 				brf_super <= epf_super;
 			end
 		end
@@ -6518,7 +6553,7 @@ always @(posedge clk) begin
 				// abandoned before the fault: nothing to report
 			end
 			else if ((state == S_FETCH || state == S_IMMF) &&
-			         epf_count == 4'd0 && epf_next == mem_addr) begin
+			         epf_count == 4'd0 && epf_next == mem_addr_q) begin
 				if (in_exc) fatal_halt;
 				else aerr_start;
 			end
@@ -6565,9 +6600,9 @@ always @(posedge clk) begin
 		         (epf_ftail[1] ? (epf_count <= 4'd7) : (epf_count <= 4'd6)))
 		begin
 			epf_brf <= 0;
-			mem_req <= 1; mem_write <= 0; mem_instr <= 1;
+			mem_req <= 1; mem_write <= 0; mem_instr_q <= 1;
 			mem_size <= epf_ftail[1] ? `AP040_SZ_W : `AP040_SZ_L;
-			mem_addr <= epf_ftail;
+			mem_addr_q <= epf_ftail;
 			fc_r <= epf_super ? `AP040_FC_SUPER_PROG : `AP040_FC_USER_PROG;
 			epf_pend <= 1;
 			epf_pend_lw <= ~epf_ftail[1];
