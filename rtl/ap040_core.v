@@ -624,6 +624,9 @@ reg        epf_err;              // the fill engine faulted: re-issue on demand
 reg        epf_brf;              // queue was seeded by branch-refill buffer
 reg        epf_pend_seed;         // ... the outstanding fetch is a redirect's own
 reg        brf_seed_ok;           // the last acknowledged fetch was a redirect's
+reg  [3:0] brf_seed_n;            // words the last redirect seeded from the buffer
+reg        brf_seed_req;          // seed the queue from the buffer this cycle (one shared block)
+reg  [3:0] brf_seed_a;            // ... starting at this sector word
 // The cache identifies its offered line physically; the queue and the
 // refill buffer are logical.  Record the logical line and context of every
 // acknowledged instruction fetch: the offer that follows is that line.
@@ -1449,24 +1452,32 @@ task issue_ifetch;
 			epf_flushed = 1;
 			if (epf_pend) epf_kill <= 1;
 			else epf_kill <= 0;
-			if (refill_hit) begin
+			if (refill_hit) begin : brf_seed
+				// Seed every valid word from the target to the end of the
+				// sector, up to the queue's eight.  Four (the entry
+				// condition) cover the canonical two-op DBcc loop; a longer
+				// loop body seeded whole needs no fetch at all, where the
+				// four-word seed left it taking demand fetches once its
+				// sequences got short (Sieve inner loop, 2026-09-14).
+				// Only the word count is computed here; the data muxes live
+				// in one shared block at the end of the always block, since
+				// this task is expanded at eight call sites (eight copies of
+				// eight 16-way word muxes doubled the core's logic).
+				reg [4:0] w;
+				reg       ok;
+				integer   i;
 				epf_brf <= 1;
-				// Four words cover the canonical two-op DBcc loop.  Requiring
-				// the complete window keeps partial prefixes off the redirect path.
-				if (a[1]) begin
-					epf_data[0] <= brf_data[a[4:2]][15:0];
-					epf_data[1] <= brf_data[a[4:2] + 3'd1][31:16];
-					epf_data[2] <= brf_data[a[4:2] + 3'd1][15:0];
-					epf_data[3] <= brf_data[a[4:2] + 3'd2][31:16];
+				ok = 1; w = 5'd0;
+				for (i = 0; i < 8; i = i + 1) begin
+					w = {1'b0, a[4:1]} + i[4:0];
+					ok = ok && !w[4] && brf_valid[w[3:0]];
+					if (ok) brf_seed_n = brf_seed_n + 4'd1;
 				end
-				else begin
-					epf_data[0] <= brf_data[a[4:2]][31:16];
-					epf_data[1] <= brf_data[a[4:2]][15:0];
-					epf_data[2] <= brf_data[a[4:2] + 3'd1][31:16];
-					epf_data[3] <= brf_data[a[4:2] + 3'd1][15:0];
-				end
-				epf_count <= 4'd4; epf_fill <= 3'd4;
-				epf_ftail <= a + 32'd8;
+				brf_seed_req = 1;
+				brf_seed_a   = a[4:1];
+				epf_count <= brf_seed_n;
+				epf_fill  <= brf_seed_n[2:0];
+				epf_ftail <= a + {27'd0, brf_seed_n, 1'b0};
 			end
 			else begin
 				epf_brf   <= 0;
@@ -1559,6 +1570,7 @@ task immf_reg;
 	input [3:0] da;
 	reg  [31:0] v;
 	begin
+		v = 32'd0;
 		if (state == S_DECODE && !epf_flushed && !epf_pend && !mem_ack &&
 		    ((n == 2'd2) ? epf_ready_pc2 : epf_ready_pc)) begin
 			v = (n == 2'd2) ? {epf_data[epf_head], epf_data[epf_head + 3'd1]}
@@ -1710,8 +1722,12 @@ task ea_operand_start;
 	input [1:0] size;
 	input [7:0] ret;
 	reg ext_inline;
+	reg        direct, drd;      // a direct path resolved here: read / no read
+	reg [31:0] da;               // its address
+	reg [7:0]  dret;             // where its read returns
 	begin
 		ea_start(mode, rn, size, ret);
+		direct = 0; drd = 0; da = 32'd0; dret = ret;
 		// From S_PIPE_START, with the base register already on port A and
 		// the extension word resident in the queue, consume it here instead
 		// of spending S_IMMF on the same pop.  A pending register/stack
@@ -1725,6 +1741,25 @@ task ea_operand_start;
 		             !mem_ack && epf_ready_pc && (rr_a == {1'b1, rn}) &&
 		             !rf_we && !aux_we;
 		case (mode)
+			// (An), (An)+, -(An) destination with the base settled on port
+			// A: record the address (and the register update) here, as
+			// S_EA_DISP would a cycle later, and land where S_PIPE_DEA
+			// would have.  A pending register write keeps the old path.
+			3'b010, 3'b011, 3'b100:
+				if (ret == S_PIPE_DEA && (state == S_PIPE_START) &&
+				    (rr_a == {1'b1, rn}) && !rf_we && !aux_we) begin
+					da = (mode == 3'b100) ? rf_rdata_a - an_adj(rn, size) : rf_rdata_a;
+					if (mode == 3'b011) begin
+						rfw({1'b1, rn}, rf_rdata_a + an_adj(rn, size));
+						u_rec({1'b1, rn}, rf_rdata_a);
+					end
+					else if (mode == 3'b100) begin
+						rfw({1'b1, rn}, da);
+						u_rec({1'b1, rn}, rf_rdata_a);
+					end
+					dst_addr <= da;
+					direct = 1; drd = p_rmw; dret = S_PIPE_DDONE;
+				end
 			3'b101:
 				if (ext_inline && ret == S_PIPE_SRD) begin
 					// d16(An) source: base on port A, displacement at the
@@ -1735,7 +1770,8 @@ task ea_operand_start;
 					epf_pop = 2'd1;
 					epf_issue = 1;
 					if (p_dst == DK_REG) rr_b <= p_dreg;
-					mrd(rf_rdata_a + sxw(epf_data[epf_head]), size, S_PIPE_SDONE);
+					da = rf_rdata_a + sxw(epf_data[epf_head]);
+					direct = 1; drd = 1; dret = S_PIPE_SDONE;
 				end
 				else if (ext_inline && ret == S_PIPE_DEA) begin
 					// d16(An) destination: same, landing where S_PIPE_DEA
@@ -1743,10 +1779,9 @@ task ea_operand_start;
 					pc <= pc + 32'd2;
 					epf_pop = 2'd1;
 					epf_issue = 1;
-					dst_addr <= rf_rdata_a + sxw(epf_data[epf_head]);
-					if (p_rmw)
-						mrd(rf_rdata_a + sxw(epf_data[epf_head]), size, S_PIPE_DDONE);
-					else state <= S_EXEC;
+					da = rf_rdata_a + sxw(epf_data[epf_head]);
+					dst_addr <= da;
+					direct = 1; drd = p_rmw; dret = S_PIPE_DDONE;
 				end
 				else if (ext_inline) begin
 					imm <= {16'd0, epf_data[epf_head]};
@@ -1778,6 +1813,11 @@ task ea_operand_start;
 			end
 			default: begin end
 		endcase
+		// the one read issue of this task: every direct path above lands here
+		if (direct) begin
+			if (drd) mrd(da, size, dret);
+			else state <= S_EXEC;
+		end
 	end
 endtask
 
@@ -2183,7 +2223,7 @@ task decode_dbcc_brf;
 		          : brf_data[a[4:2]][31:16];
 		issue_ifetch(a, sr_s);
 		epf_head  <= 3'd1;
-		epf_count <= 4'd3;
+		epf_count <= brf_seed_n - 4'd1;
 		epf_next  <= a + 32'd2;
 		epf_issue = 1;
 
@@ -2352,11 +2392,16 @@ wire        hint_pipe_src = (state == S_PIPE_START) && (p_src == SK_MEM);
 wire        hint_ext_ok   = epf_ready_pc && !rf_we && !aux_we;
 wire        hint_pipe_dst = (state == S_PIPE_START) && (p_src != SK_MEM) &&
                             (p_dst == DK_MEM) && p_rmw &&
-                            (dst_mode_r == 3'b101) && hint_ext_ok &&
-                            (rr_a == {1'b1, dst_rn_r});
+                            (rr_a == {1'b1, dst_rn_r}) &&
+                            (((dst_mode_r == 3'b101) && hint_ext_ok) ||
+                             (dst_mode_r == 3'b010) || (dst_mode_r == 3'b011) ||
+                             (dst_mode_r == 3'b100));
 wire        hint_pipe = hint_pipe_src || hint_pipe_dst;
 wire [31:0] hint_d16_addr = rf_rdata_a + sxw(epf_data[epf_head]);
-wire [31:0] hint_pipe_addr = hint_pipe_dst ? hint_d16_addr :
+wire [31:0] hint_dst_addr = (dst_mode_r == 3'b101) ? hint_d16_addr :
+                            (dst_mode_r == 3'b100) ? rf_rdata_a - an_adj(dst_rn_r, p_dsize) :
+                            rf_rdata_a;
+wire [31:0] hint_pipe_addr = hint_pipe_dst ? hint_dst_addr :
                              (src_mode_r == 3'b100)
                            ? rf_rdata_a - an_adj(src_rn_r, p_ssize) :
                              ((src_mode_r == 3'b101) && hint_ext_ok &&
@@ -2384,6 +2429,9 @@ always @(posedge clk) begin
 	epf_pop     = 2'd0;
 	epf_fillw   = 4'd0;
 	rd_queue_pop = 0;
+	brf_seed_n  = 4'd0;
+	brf_seed_req = 0;
+	brf_seed_a  = 4'd0;
 
 	if (!nreset) begin
 		state <= S_START;
@@ -3038,7 +3086,9 @@ always @(posedge clk) begin
 			end
 
 			//------------------------------------------------ operand pipeline
-			S_PIPE_START: begin
+			S_PIPE_START: begin : pipe_start
+				reg dst_go;   // start the memory destination's EA (one call site)
+				dst_go = 0;
 				// x_ext keeps a decode-time immediate through EA fetches;
 				// for long MUL/DIV it was already captured in S_MDL_EXT
 				if (exec_kind != EK_MD_L) x_ext <= imm;
@@ -3080,14 +3130,22 @@ always @(posedge clk) begin
 							rr_a <= p_sreg; rr_b <= p_dreg;
 							state <= S_PIPE_REGS;
 						end
+						// Memory destination with the ports already placed by
+						// decode: capture the source from port B and start the
+						// destination EA now, skipping S_PIPE_SREG, S_PIPE_DST
+						// and (for the simple modes) S_EA_DISP.
+						else if (p_dst == DK_MEM && !p_dst_mem_bit &&
+						         (rr_b == p_sreg) && (rr_a == {1'b1, dst_rn_r})) begin
+							src_val <= rf_capture_b;
+							dst_go = 1;
+						end
 						else begin rr_a <= p_sreg; state <= S_PIPE_SREG; end
 					SK_IMM: begin
 						src_val <= imm;
 						if (p_dst == DK_REG) begin
 							rr_b <= p_dreg; state <= S_PIPE_REGS;
 						end
-						else if (p_dst == DK_MEM)
-							ea_operand_start(dst_mode_r, dst_rn_r, p_dsize, S_PIPE_DEA);
+						else if (p_dst == DK_MEM) dst_go = 1;
 						else state <= S_PIPE_DST;
 					end
 					default:
@@ -3097,10 +3155,13 @@ always @(posedge clk) begin
 						// A memory destination with no source operand starts
 						// its EA here instead of spending S_PIPE_DST on the
 						// same dispatch (and S_EA_DISP on extension modes).
-						else if (p_dst == DK_MEM)
-							ea_operand_start(dst_mode_r, dst_rn_r, p_dsize, S_PIPE_DEA);
+						else if (p_dst == DK_MEM) dst_go = 1;
 						else state <= S_PIPE_DST;
 				endcase
+				// one expansion of the EA-start task serves every memory
+				// destination above (each expansion carries its own read
+				// issue logic; four of them doubled the core's logic)
+				if (dst_go) ea_operand_start(dst_mode_r, dst_rn_r, p_dsize, S_PIPE_DEA);
 			end
 
 			// The EA is finished by now, so port B is free: point it at a
@@ -5571,7 +5632,7 @@ always @(posedge clk) begin
 								go_illegal;
 							else begin
 								alu_op <= `AP040_ALU_BTST + {4'd0, ir[7:6]};
-								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9};
+								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
 								if (ir[7:6] == 2'b00) p_wbsup <= 1; // BTST
 								if (ea_is_imm)
 									immf(2'd1, S_BTSTI);
@@ -5750,6 +5811,15 @@ always @(posedge clk) begin
 							else begin
 								p_dst <= DK_MEM;
 								dst_mode_r <= d_op8_6; dst_rn_r <= d_reg9;
+								// A register or immediate source leaves port A
+								// free for the destination base and port B for
+								// the source register, so S_PIPE_START can start
+								// the destination EA at once (memory-destination
+								// fast path).  A memory source keeps port A.
+								if (d_mode == 3'b000 || d_mode == 3'b001 || ea_is_imm)
+									rr_a <= {1'b1, d_reg9};
+								if (d_mode == 3'b000 || d_mode == 3'b001)
+									rr_b <= {d_mode[0], d_rn};
 							end
 							if (ea_is_imm && (d_op8_6 == 3'b000 || d_op8_6 == 3'b001))
 								immf_reg((move_size == `AP040_SZ_L) ? 2'd2 : 2'd1, {d_op8_6[0], d_reg9});
@@ -6277,7 +6347,7 @@ always @(posedge clk) begin
 							end
 							else begin
 								// Dn OR <ea> -> <ea>
-								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9};
+								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
 								p_dst <= DK_MEM; p_rmw <= 1;
 								dst_mode_r <= d_mode; dst_rn_r <= d_rn;
 								// The register-to-EA OR form is memory-only.
@@ -6332,7 +6402,7 @@ always @(posedge clk) begin
 							end
 							else begin
 								// Dn op <ea> -> <ea>
-								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9};
+								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
 								p_dst <= DK_MEM; p_rmw <= 1;
 								dst_mode_r <= d_mode; dst_rn_r <= d_rn;
 								// The register-to-EA ADD/SUB form is memory-only;
@@ -6391,7 +6461,7 @@ always @(posedge clk) begin
 							alu_op <= `AP040_ALU_EOR;
 							op_size <= std_size;
 							p_dsize <= std_size;
-							p_src <= SK_REG; p_sreg <= {1'b0, d_reg9};
+							p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
 							if (dst_not_alt) go_illegal;
 							else begin
 								p_dst <= DK_MEM; p_rmw <= 1;
@@ -6457,7 +6527,7 @@ always @(posedge clk) begin
 								else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
 							end
 							else begin
-								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9};
+								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
 								p_dst <= DK_MEM; p_rmw <= 1;
 								dst_mode_r <= d_mode; dst_rn_r <= d_rn;
 								// The register-to-EA AND form is memory-only.
@@ -6521,7 +6591,7 @@ always @(posedge clk) begin
 							op_size <= std_size;
 							p_dst <= DK_REG; p_dreg <= {1'b0, d_rn};
 							if (ir[5]) begin
-								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9};
+								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
 							end
 							else begin
 								p_src <= SK_IMPL;
@@ -6828,6 +6898,19 @@ always @(posedge clk) begin
 			epf_kill <= 0;
 		end
 
+		// The redirect's refill seed, once for every issue_ifetch site: the
+		// words from the buffer land last, over any ring write earlier in
+		// this cycle (a killed fetch's append, a line offer).
+		if (brf_seed_req) begin : brf_seed_data
+			reg [4:0] sw;
+			integer   si;
+			for (si = 0; si < 8; si = si + 1) begin
+				sw = {1'b0, brf_seed_a} + si[4:0];
+				if (si[3:0] < brf_seed_n)
+					epf_data[si] <= sw[0] ? brf_data[sw[3:1]][15:0]
+					                      : brf_data[sw[3:1]][31:16];
+			end
+		end
 		// Queue bookkeeping in one place, so that a pop and an append in the
 		// same cycle cannot lose each other's update.  A flush has already
 		// written the whole set and wins.
