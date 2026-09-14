@@ -94,7 +94,7 @@ ap040_cache dut
 	.cinv_done(cinv_done),
 	.c_req(c_req), .c_write(c_write), .c_instr(c_instr),
 	.c_size(c_size), .c_addr(c_addr), .c_wdata(c_wdata),
-	.c_fc(3'd5), .c_nocache(c_nocache),
+	.c_fc(3'd5), .c_nocache(c_nocache), .c_post_ok(1'b0),
 	.c_ack(c_ack), .c_rdata(c_rdata),
 	.m_req(m_req), .m_write(m_write), .m_instr(m_instr),
 	.m_size(m_size), .m_addr(m_addr), .m_wdata(m_wdata),
@@ -702,8 +702,10 @@ initial begin
 	//------------------------------------------------------------------
 	// T10: the first ordinary beat starts a cache miss.  Model a host that
 	// captured the surrounding line alongside that response, then require
-	// the remaining three words to be copied locally.  The CPU must still
-	// wait for a complete cache line and tag; only redundant bus beats go.
+	// the remaining three words to be copied locally.  The requested word
+	// is fetched first and acknowledged as soon as it arrives (MC68040UM
+	// 4.6.1); the host keeps the retained line valid until the fill is
+	// complete, so only that one bus beat goes to memory.
 	//------------------------------------------------------------------
 	cinv_req = 1; cinv_ic = 1; cinv_dc = 1;
 	@(negedge clk);
@@ -731,10 +733,6 @@ initial begin
 	m_line_data = {mem[32'hE000>>2], mem[32'hE004>>2],
 	               mem[32'hE008>>2], mem[32'hE00C>>2]};
 	m_line_valid = 1;
-	if (c_ack) begin
-		$display("FAIL test 10: CPU acknowledged before the line was complete");
-		errors = errors + 1;
-	end
 
 	line_guard = 0;
 	while (!(c_ack && ce) && line_guard < 200) begin
@@ -757,7 +755,19 @@ initial begin
 	end
 	@(negedge clk);
 	c_req = 0;
+	// the retained line stays valid until the cache has copied the rest
+	line_guard = 0;
+	while (dut.cst != 3'd0 && line_guard < 200) begin
+		@(posedge clk);
+		line_guard = line_guard + 1;
+	end
+	@(negedge clk);
 	m_line_valid = 0;
+	if ((mread_count - line_base) != 1) begin
+		$display("FAIL test 10: fill completion issued %0d bus reads, expected 1",
+		         mread_count - line_base);
+		errors = errors + 1;
+	end
 
 	line_base = mread_count;
 	expect_read(32'h0000_E000, mem[32'hE000>>2], 10);
@@ -862,6 +872,10 @@ initial begin
 	// predictor's private copy of F00C.
 	c_instr = 0;
 	expect_read(32'h0000_1000, 32'h1111_A001, 12);
+	// the data read's fill completes behind its early acknowledge; the
+	// predicted fetch is timed from an idle cache, as the test intends
+	while (dut.cst != 3'd0) @(posedge clk);
+	@(negedge clk);
 	c_instr = 1;
 	cpu_read_count_sized(32'h0000_F00C, 2'b10, d, fast_cycles);
 	if (d !== 32'hCAFE_BABE || fast_cycles >= normal_cycles) begin
@@ -939,6 +953,7 @@ initial begin
 	mem[32'hB000>>2] = 32'hDEAD_BEEF;
 	c_instr = 0;
 	expect_read(32'hA000, 32'h1234_5678, 14);
+	while (dut.cst != 3'd0) @(posedge clk);   // the fill completes behind its early ack
 	@(negedge clk); c_addr = 32'hA000;
 	repeat (2) @(posedge clk);
 	cpu_read_count_sized(32'hA001, 2'b00, d, fast_cycles);

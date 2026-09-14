@@ -131,7 +131,11 @@ wire [31:0] mm_addr, mm_wdata;
 wire  [2:0] mm_fc;
 wire        mm_ack, mm_nocache;
 wire [31:0] mm_rdata;
-wire        mm_line_stb, mem_line_stb;
+wire        mm_line_stb, mem_line_stb, mm_busy;
+wire        mmu_walker_req;
+// a fill or posted store may still own the CPU bus after its requester
+// was released: hold the walker off, as wombat_cpu does
+assign walker_req = mmu_walker_req && !mm_busy;
 wire [31:4] mm_line_tag, mem_line_tag;
 wire [127:0] mm_line_data, mem_line_data;
 
@@ -272,7 +276,7 @@ ap040_mmu mmu (
 	.m_line_tag(mm_line_tag),
 	.m_line_data(mm_line_data),
 
-	.walker_req(walker_req),
+	.walker_req(mmu_walker_req),
 	.walker_we(walker_we),
 	.walker_addr(walker_addr),
 	.walker_wdat(walker_wdat),
@@ -373,6 +377,7 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.c_fc(mm_fc),
 		.c_nocache(mm_nocache | ~cache_allow |
 		           (mm_instr & cache_chip & ~cache_allow_all)),
+		.c_post_ok(1'b0),   // no store queue below this bench: never post
 		.s_stb(snp_stb),
 		.s_addr(snp_addr),
 		.c_ack(mm_ack),
@@ -380,6 +385,7 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.c_line_stb(mm_line_stb),
 		.c_line_tag(mm_line_tag),
 		.c_line_data(mm_line_data),
+		.c_busy(mm_busy),
 
 		.m_req(b_req),
 		.m_write(b_write),
@@ -413,6 +419,7 @@ else begin : g_nocache
 	assign mm_line_stb = 1'b0;
 	assign mm_line_tag = 28'd0;
 	assign mm_line_data = 128'd0;
+	assign mm_busy = 1'b0;
 	assign cinv_done = 1'b1;
 	wire unused_nc = mm_nocache | cinv_req | cinv_ic | cinv_dc |
 	                 (|cacr_out);

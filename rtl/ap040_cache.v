@@ -46,6 +46,10 @@ module ap040_cache
 	input      [31:0] c_wdata,
 	input       [2:0] c_fc,
 	input             c_nocache,
+	// The platform posts writes to this address (it will accept them into
+	// its store queue and never report a bus error for them), so the cache
+	// may acknowledge such a store on admission and drain it afterwards.
+	input             c_post_ok,
 	output            c_ack,
 	output     [31:0] c_rdata,
 	// Instruction line sideband: one cycle after an instruction hit is
@@ -56,6 +60,10 @@ module ap040_cache
 	output            c_line_stb,
 	output     [31:4] c_line_tag,
 	output    [127:0] c_line_data,
+	// A fill or a posted store is still on the master side after the
+	// requester was released; hosts that share one bus with the table
+	// walker hold the walker off while this is high.
+	output            c_busy,
 
 	// master side (to the bus adapter)
 	output            m_req,
@@ -130,7 +138,8 @@ wire  [6:0] inv_idx;
 wire        cd_rd_en;
 wire  [8:0] cd_ridx, cd_widx;
 wire  [3:0] cd_we;               // one per way
-wire [31:0] cd_wdat;
+wire [31:0] cd_wdat;             // single-word writes (fills, aligned merges)
+wire [31:0] cd_wdat0, cd_wdat1, cd_wdat2, cd_wdat3;   // per array, for pair merges
 
 // Reads free-run: the address is held for the whole request, so a stalled
 // ce simply re-reads the same row.  Only the writes are ce-gated.
@@ -149,10 +158,10 @@ dpram #(7, ROWW) ctag_ram
 
 wire  [8:0] cd_ridx0, cd_ridx1, cd_ridx2, cd_ridx3;
 always @(posedge clk) begin
-	if (ce & cd_we[0]) cdata0[cd_widx] <= cd_wdat;
-	if (ce & cd_we[1]) cdata1[cd_widx] <= cd_wdat;
-	if (ce & cd_we[2]) cdata2[cd_widx] <= cd_wdat;
-	if (ce & cd_we[3]) cdata3[cd_widx] <= cd_wdat;
+	if (ce & cd_we[0]) cdata0[cd_widx] <= cd_wdat0;
+	if (ce & cd_we[1]) cdata1[cd_widx] <= cd_wdat1;
+	if (ce & cd_we[2]) cdata2[cd_widx] <= cd_wdat2;
+	if (ce & cd_we[3]) cdata3[cd_widx] <= cd_wdat3;
 	if (ce & cd_rd_en) begin
 		data_q0 <= cdata0[cd_ridx0];
 		data_q1 <= cdata1[cd_ridx1];
@@ -170,7 +179,19 @@ wire        ena       = c_instr ? ie : de;
 wire        fits_long = (c_size == `AP040_SZ_B) ||
                         (c_size == `AP040_SZ_W && !c_addr[0]) ||
                         (c_size == `AP040_SZ_L && c_addr[1:0] == 2'b00);
-wire        bypass    = c_nocache || !ena || c_write || !fits_long;
+// A read that straddles two longwords of the same line (a longword at
+// offset 1, 2 or 3, or a word at offset 3, in words 0 to 2) is served from
+// the cache too: on a hit the whole line of the hit way is read one cycle
+// later and the pair assembled; on a miss the fill captures both words.
+// Line-crossing accesses keep the bypass (the two halves may translate
+// and fault differently, and the bus adapter already splits them).
+wire        span2     = !c_instr && (c_addr[3:2] != 2'd3) &&
+                        ((c_size == `AP040_SZ_L && c_addr[1:0] != 2'b00) ||
+                         (c_size == `AP040_SZ_W && c_addr[1:0] == 2'b11));
+// a word at offset 1 sits inside one longword: extracted, not spanned
+wire        fits_lane = fits_long ||
+                        (!c_instr && c_size == `AP040_SZ_W && c_addr[1:0] == 2'b01);
+wire        bypass    = c_nocache || !ena || c_write || !(fits_lane || span2);
 
 // Number of bytes following the first byte.  Use a five-bit sum so a
 // transfer ending beyond offset 15 cannot wrap before the comparison.
@@ -217,10 +238,22 @@ reg  [31:0] r_addr;
 reg   [1:0] r_size;
 reg   [1:0] r_off;
 reg  [31:0] fill_hold;           // requested longword captured during fill
+reg  [31:0] fill_hold2;          // ... and its successor, for a spanning read
+reg         r_span2;             // the request straddles two longwords
+reg         look2;               // C_LOOK's second cycle: the line read is in
+reg   [1:0] r_hway;              // the way the first C_LOOK cycle found
+reg   [1:0] fill_cnt;            // beats completed in this fill (requested word first)
+reg   [2:0] r_fc;                // the fill's own function code (the requester may be gone)
+reg         sline_ready;         // a spanning store's line read has completed
+reg         fill_acked;          // the requester already has its data
 reg  [31:0] r_wdata;             // captured aligned store data for hit update
 reg         ack_r;
 reg  [31:0] rdata_r;
 reg         pass_store_chk;      // C_PASS owns an aligned store tag lookup
+reg         post_active;         // C_PASS drains a store already acknowledged
+reg  [31:0] p_addr, p_wdata;     // ... from these copies, not the pins
+reg   [1:0] p_size;
+reg   [2:0] p_fc;
 
 // One-longword sequential instruction lookahead.  A normal I-cache hit has
 // already identified the resident way and leaves the data RAM otherwise idle
@@ -278,9 +311,26 @@ function [31:0] lw_extract;
 					default: lw_extract = {24'd0, lw[7:0]};
 				endcase
 			`AP040_SZ_W:
-				lw_extract = off[1] ? {16'd0, lw[15:0]} : {16'd0, lw[31:16]};
+				case (off)
+					2'd0: lw_extract = {16'd0, lw[31:16]};
+					2'd1: lw_extract = {16'd0, lw[23:8]};
+					2'd2: lw_extract = {16'd0, lw[15:0]};
+					default: lw_extract = {16'd0, lw[7:0], 8'd0};   // never: spanned
+				endcase
 			default: lw_extract = lw;
 		endcase
+	end
+endfunction
+
+// Extract a spanning access from two consecutive big-endian longwords.
+function [31:0] span_extract;
+	input [63:0] pair;      // {word w, word w+1}
+	input  [1:0] size;
+	input  [1:0] off;
+	reg   [63:0] sh;
+	begin
+		sh = pair << (8 * off);
+		span_extract = (size == `AP040_SZ_W) ? {16'd0, sh[63:48]} : sh[63:32];
 	end
 endfunction
 
@@ -302,10 +352,32 @@ function [31:0] lw_merge;
 					default: lw_merge = {old_lw[31:8], new_data[7:0]};
 				endcase
 			`AP040_SZ_W:
-				lw_merge = off[1] ? {old_lw[31:16], new_data[15:0]}
-				                      : {new_data[15:0], old_lw[15:0]};
+				case (off)
+					2'd0: lw_merge = {new_data[15:0], old_lw[15:0]};
+					2'd1: lw_merge = {old_lw[31:24], new_data[15:0], old_lw[7:0]};
+					2'd2: lw_merge = {old_lw[31:16], new_data[15:0]};
+					default: lw_merge = old_lw;   // never: spanned
+				endcase
 			default: lw_merge = new_data;
 		endcase
+	end
+endfunction
+
+// Merge a spanning store into two consecutive big-endian longwords.
+function [63:0] span_merge;
+	input [63:0] pair;      // {word w, word w+1}
+	input [31:0] new_data;
+	input  [1:0] size;
+	input  [1:0] off;
+	reg   [63:0] mask, val;
+	begin
+		mask = (size == `AP040_SZ_W) ? 64'h0000_0000_0000_FFFF : 64'h0000_0000_FFFF_FFFF;
+		val  = (size == `AP040_SZ_W) ? {48'd0, new_data[15:0]} : {32'd0, new_data};
+		// byte k of the pair sits at [63-8k]; the operand's last byte is
+		// off+3 (long) or off+1 (word)
+		mask = (size == `AP040_SZ_W) ? (mask << (48 - 8 * off)) : (mask << (32 - 8 * off));
+		val  = (size == `AP040_SZ_W) ? (val  << (48 - 8 * off)) : (val  << (32 - 8 * off));
+		span_merge = (pair & ~mask) | val;
 	end
 endfunction
 
@@ -357,7 +429,14 @@ wire fill_active = (cst == C_FILL);
 // cached word.  They still pass through to memory; only the needless
 // invalidate/refill cycle is removed.  Every other write keeps the existing
 // conservative set-invalidate path.
-wire store_update_ok = c_write && !c_instr && de && !c_nocache && fits_long;
+wire store_lane      = fits_long ||
+                       (c_size == `AP040_SZ_W && c_addr[1:0] == 2'b01);
+wire store_update_ok = c_write && !c_instr && de && !c_nocache && store_lane;
+// A store that straddles two longwords of one line updates both words of
+// a matching line (MC68040UM 4.3.1.1: write-through stores update matching
+// lines) instead of invalidating its whole set.
+wire store_update2   = c_write && !c_instr && de && !c_nocache && span2;
+wire store_any_update = store_update_ok || store_update2;
 
 // Set when a transfer this cache issued took a bus error; cleared when
 // the core withdraws the faulted request.  Without it the level-held
@@ -365,7 +444,7 @@ wire store_update_ok = c_write && !c_instr && de && !c_nocache && fits_long;
 // the address that just faulted.
 reg  err_hold;
 wire store_lookup_accept = (cst == C_IDLE) && c_req && !ack_r &&
-	                         !err_hold && !store_inv_lost && store_update_ok;
+	                         !err_hold && !store_inv_lost && store_any_update;
 // A cache-inhibited READ that hits a resident line must invalidate it
 // while it bypasses (WinUAE dcache040: a hit under CACHE_DISABLE_MMU is
 // pushed and invalidated before the uncached access; the icache path
@@ -392,16 +471,18 @@ wire [31:0] fill_line_word = (r_beat == 2'd0) ? m_line_data[127:96] :
 wire fill_line_write = fill_line_match;
 
 assign m_req   = fill_active ? !fill_line_match :
-                 (pass_active ? c_req : 1'b0);
-assign m_write = fill_active ? 1'b0 : c_write;
-assign m_instr = c_instr;
-assign m_size  = fill_active ? `AP040_SZ_L : c_size;
-assign m_addr  = fill_active ? {r_addr[31:4], r_beat, 2'b00} : c_addr;
-assign m_wdata = c_wdata;
-assign m_fc    = c_fc;
+                 (pass_active ? (post_active | c_req) : 1'b0);
+assign m_write = fill_active ? 1'b0 : (post_active | c_write);
+assign m_instr = fill_active ? r_bank : (post_active ? 1'b0 : c_instr);
+assign m_size  = fill_active ? `AP040_SZ_L : (post_active ? p_size : c_size);
+assign m_addr  = fill_active ? {r_addr[31:4], r_beat, 2'b00} :
+                 (post_active ? p_addr : c_addr);
+assign m_wdata = post_active ? p_wdata : c_wdata;
+assign m_fc    = fill_active ? r_fc : (post_active ? p_fc : c_fc);
 
-assign c_ack   = pass_active ? m_ack : ack_r;
+assign c_ack   = (pass_active && !post_active) ? m_ack : ack_r;
 assign c_line_stb  = iline_stb && iline_valid;
+assign c_busy      = fill_active || (cst == C_TAGW) || post_active;
 assign c_line_tag  = iline_tag;
 assign c_line_data = iline_data;
 assign c_rdata = pass_active ? m_rdata : rdata_r;
@@ -410,7 +491,11 @@ assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
                    c_req && !ack_r && !c_write && !bypass &&
                    !ci_inv_pend && !store_inv_lost;
 
-assign tag_ridx  = a_row;
+// While a fill or a posted store drains, the requester may already have
+// been released and c_addr has moved on to its next request or hint: the
+// tag row that C_TAGW rewrites and that the posted store's merge consults
+// must be the transaction's own row, not the live address's.
+assign tag_ridx  = (fill_active || (cst == C_TAGW) || post_active) ? r_row : a_row;
 wire [87:0] tags_next = (r_way == 2'd0) ? {tag_q[87:22], r_tag} :
                         (r_way == 2'd1) ? {tag_q[87:44], r_tag, tag_q[21:0]} :
                         (r_way == 2'd2) ? {tag_q[87:66], r_tag, tag_q[43:0]} :
@@ -432,7 +517,7 @@ assign tag_wdat  = (cst == C_SWEEP) ? {ROWW{1'b0}}
 // invalidate, because a missed snoop leaves stale data while a delayed
 // store invalidate is picked up again from snoop_pend below.
 wire store_inv = ((cst == C_IDLE) && c_req && c_write && !ack_r &&
-	                  !store_inv_lost && !store_update_ok) ||
+	                  !store_inv_lost && !store_any_update) ||
                  ((cst == C_PASS) && winv_pend) ||
                  (cst == C_WINV);
 // Snoop invalidates are FREE-RUNNING (5.1): a chipset write must land
@@ -518,7 +603,7 @@ always @(posedge clk) begin
 		end
 	end
 end
-wire idle_hit = rd_accept && !ipred_hit && !err_hold && !m_err &&
+wire idle_hit = rd_accept && !ipred_hit && !err_hold && !m_err && fits_lane &&
                 idle_data_valid && idle_tag_valid &&
                 (idle_data_idx == {c_instr, c_addr[9:2]}) &&
                 (idle_tag_idx == a_row) && look_hit &&
@@ -526,27 +611,48 @@ wire idle_hit = rd_accept && !ipred_hit && !err_hold && !m_err &&
 
 // Any instruction hit that identified its way (a C_LOOK hit, or an idle
 // admission) reads that way's whole line on the same edge it acknowledges.
-wire iline_seed_read = (cst == C_LOOK) && look_hit && r_bank;
+wire iline_seed_read = (cst == C_LOOK) && look_hit && r_bank && !look2;
 wire iline_idle_read = idle_hit && c_instr;
-wire iline_read = iline_seed_read || iline_idle_read;
-wire [5:0] iline_read_set = iline_seed_read ? r_row[5:0] : c_addr[9:4];
+wire dline_read = (cst == C_LOOK) && look_hit && !r_bank && r_span2 && !look2;
+wire iline_tagw_read = (cst == C_TAGW) && r_bank && !fill_snooped && !snoop_fill_row;
+wire sline_read = (cst == C_PASS) && pass_store_chk && r_span2 && look_hit && !sline_ready;
+wire iline_read = iline_seed_read || iline_idle_read || dline_read || iline_tagw_read || sline_read;
+wire [6:0] line_read_row = iline_idle_read ? {1'b1, c_addr[9:4]} : r_row;
+wire [1:0] line_read_way = iline_tagw_read ? r_way : hit_way;
 
 assign cd_rd_en  = (cst == C_IDLE) || rd_accept || store_lookup_accept || iline_read;
 // word-wise: array k at way (k - w); line-wise: every array at the hit way
 wire  [1:0] rd_w = c_addr[3:2];
-assign cd_ridx0  = iline_read ? {1'b1, iline_read_set, hit_way}
+assign cd_ridx0  = iline_read ? {line_read_row, line_read_way}
                               : {c_instr, a_set, 2'd0 - rd_w};
-assign cd_ridx1  = iline_read ? {1'b1, iline_read_set, hit_way}
+assign cd_ridx1  = iline_read ? {line_read_row, line_read_way}
                               : {c_instr, a_set, 2'd1 - rd_w};
-assign cd_ridx2  = iline_read ? {1'b1, iline_read_set, hit_way}
+assign cd_ridx2  = iline_read ? {line_read_row, line_read_way}
                               : {c_instr, a_set, 2'd2 - rd_w};
-assign cd_ridx3  = iline_read ? {1'b1, iline_read_set, hit_way}
+assign cd_ridx3  = iline_read ? {line_read_row, line_read_way}
                               : {c_instr, a_set, 2'd3 - rd_w};
-wire store_hit_write = (cst == C_PASS) && pass_store_chk && m_ack && look_hit;
+// the spanning pair, from the line read of way r_hway: word w in array
+// (way + w) mod 4, its successor in the next array
+wire  [1:0] sp_a0 = r_hway + r_addr[3:2];
+wire  [1:0] sp_a1 = sp_a0 + 2'd1;
+wire [31:0] sp_w0 = (sp_a0 == 2'd0) ? data_q0 : (sp_a0 == 2'd1) ? data_q1 :
+                    (sp_a0 == 2'd2) ? data_q2 : data_q3;
+wire [31:0] sp_w1 = (sp_a1 == 2'd0) ? data_q0 : (sp_a1 == 2'd1) ? data_q1 :
+                    (sp_a1 == 2'd2) ? data_q2 : data_q3;
+wire store_hit_write = (cst == C_PASS) && pass_store_chk && m_ack && look_hit &&
+                       (!r_span2 || sline_ready);
+wire store_pair_write = store_hit_write && r_span2;
 wire fill_beat_write = ((cst == C_FILL) && r_issued && m_ack) || fill_line_write;
 wire  [1:0] wr_way = store_hit_write ? hit_way : r_way;
 wire  [1:0] wr_arr = wr_way + r_beat;
-assign cd_we     = (store_hit_write || fill_beat_write) ? (4'd1 << wr_arr) : 4'd0;
+wire  [1:0] wr_arr1 = wr_arr + 2'd1;
+wire [63:0] pair_new = span_merge({sp_w0, sp_w1}, r_wdata, r_size, r_off);
+assign cd_we     = store_pair_write ? ((4'd1 << wr_arr) | (4'd1 << wr_arr1)) :
+                   (store_hit_write || fill_beat_write) ? (4'd1 << wr_arr) : 4'd0;
+assign cd_wdat0  = store_pair_write ? (wr_arr1 == 2'd0 ? pair_new[31:0] : pair_new[63:32]) : cd_wdat;
+assign cd_wdat1  = store_pair_write ? (wr_arr1 == 2'd1 ? pair_new[31:0] : pair_new[63:32]) : cd_wdat;
+assign cd_wdat2  = store_pair_write ? (wr_arr1 == 2'd2 ? pair_new[31:0] : pair_new[63:32]) : cd_wdat;
+assign cd_wdat3  = store_pair_write ? (wr_arr1 == 2'd3 ? pair_new[31:0] : pair_new[63:32]) : cd_wdat;
 assign cd_widx   = {r_bank, r_row[5:0], wr_way};
 assign cd_wdat   = store_hit_write ? lw_merge(data_hit, r_wdata, r_size, r_off) :
 	                  (fill_line_write ? fill_line_word : m_rdata);
@@ -572,6 +678,9 @@ always @(posedge clk) begin
 		r_row <= 0; r_tag <= 0; r_word <= 0; r_way <= 0; r_bank <= 0;
 		r_beat <= 0; r_issued <= 0; r_addr <= 0; r_size <= 0; r_off <= 0;
 		fill_hold <= 0; r_wdata <= 0; pass_store_chk <= 0;
+		fill_hold2 <= 0; r_span2 <= 0; look2 <= 0; r_hway <= 0;
+		fill_cnt <= 0; fill_acked <= 0; r_fc <= 0; sline_ready <= 0;
+		post_active <= 0; p_addr <= 0; p_wdata <= 0; p_size <= 0; p_fc <= 0;
 		iline_pending <= 0; iline_valid <= 0; iline_way <= 0;
 		iline_tag <= 0; iline_data <= 0; iline_stb <= 0; iline_stb_pend <= 0;
 		ack_r <= 0; rdata_r <= 0;
@@ -607,7 +716,7 @@ always @(posedge clk) begin
 		// (store_inv's !store_inv_lost term), so the single slot cannot
 		// be overwritten.
 		if (snoop_wr && (cst == C_IDLE) && c_req && c_write && !ack_r &&
-		    !store_inv_lost && !store_update_ok) begin
+		    !store_inv_lost && !store_any_update) begin
 			store_inv_lost <= 1;
 			store_inv_set  <= c_addr[9:4];
 		end
@@ -699,12 +808,23 @@ always @(posedge clk) begin
 							// data ways here, then merges into a matching word only
 							// when memory acknowledges it in C_PASS.  A fault can
 							// therefore never leave uncommitted data in the cache.
-							pass_store_chk <= store_update_ok;
-							if (store_update_ok) begin
+							pass_store_chk <= store_any_update;
+							r_span2 <= store_update2;
+							sline_ready <= 0;
+							// A posted store is acknowledged now and drained
+							// from its captured copy while the core moves on.
+							if (c_post_ok) begin
+								ack_r <= 1;
+								post_active <= 1;
+								p_addr <= c_addr; p_wdata <= c_wdata;
+								p_size <= c_size; p_fc <= c_fc;
+							end
+							if (store_any_update) begin
 								r_row   <= {1'b0, a_set};
 								r_tag   <= a_tag;
 								r_bank  <= 0;
 								r_beat  <= c_addr[3:2];
+								r_addr  <= c_addr;
 								r_size  <= c_size;
 								r_off   <= c_addr[1:0];
 								r_wdata <= c_wdata;
@@ -738,6 +858,9 @@ always @(posedge clk) begin
 						r_size <= c_size;
 						r_off <= c_addr[1:0];
 						r_word <= {2'd0, c_addr[3:2]};
+						r_span2 <= span2;
+						r_fc <= c_fc;
+						look2 <= 0;
 						cst <= C_LOOK;
 					end
 				end
@@ -748,6 +871,17 @@ always @(posedge clk) begin
 				// served it; a snoop or a recorded first-set replay owns
 				// the port this cycle and winv stays pending
 				if (!s_stb && !store_inv_lost) winv_pend <= 0;
+				// a spanning store's line read (sline_read) completes next
+				// cycle; an acknowledge that arrives first cannot merge and
+				// the matching line is invalidated instead
+				if (sline_read) begin
+					r_hway <= hit_way;
+					sline_ready <= 1;
+				end
+				if (pass_store_chk && r_span2 && m_ack && look_hit && !sline_ready) begin
+					ci_inv_pend <= 1;
+					ci_inv_row  <= r_row;
+				end
 				if (pass_ci_chk) begin
 					pass_ci_chk <= 0;
 					if (look_hit) begin
@@ -759,13 +893,16 @@ always @(posedge clk) begin
 					pass_store_chk <= 0;
 					// a passed access faulted: release the bus, but a
 					// still-owed invalidate is honoured (invalidating
-					// more is always safe under write-through)
-					err_hold <= 1;
+					// more is always safe under write-through).  A posted
+					// store was promised not to fault; nothing to hold.
+					err_hold <= !post_active;
+					post_active <= 0;
 					cst <= (winv_pend && (s_stb || store_inv_lost))
 					       ? C_WINV : C_IDLE;
 				end
 				else if (m_ack) begin
 					pass_store_chk <= 0;
+					post_active <= 0;
 					cst <= (winv_pend && (s_stb || store_inv_lost))
 					       ? C_WINV : C_IDLE;
 				end
@@ -800,7 +937,31 @@ always @(posedge clk) begin
 			end
 
 			C_LOOK: begin
-				if (look_hit && !look_snooped && !snoop_look_row) begin
+				if (look2) begin
+					// the line read of the hit way completed: assemble the
+					// spanning pair (a snoop meanwhile forces the refill)
+					look2 <= 0;
+					if (!look_snooped && !snoop_look_row) begin
+						rdata_r <= span_extract({sp_w0, sp_w1}, r_size, r_off);
+						ack_r <= 1;
+						cst <= C_IDLE;
+					end
+					else begin
+						r_way <= !v_w0 ? 2'd0 : !v_w1 ? 2'd1 : !v_w2 ? 2'd2 :
+						         !v_w3 ? 2'd3 : tag_q[93:92];
+						r_beat <= r_addr[3:2];
+						fill_cnt <= 0;
+						fill_acked <= 0;
+						r_issued <= 0;
+						cst <= C_FILL;
+					end
+				end
+				else if (look_hit && !look_snooped && !snoop_look_row && r_span2) begin
+					// the line read runs in parallel (dline_read)
+					r_hway <= hit_way;
+					look2 <= 1;
+				end
+				else if (look_hit && !look_snooped && !snoop_look_row) begin
 					// all four ways were read alongside the tags, so the
 					// hit completes here: two cycles request-to-ack
 					rdata_r <= lw_extract(data_hit, r_size, r_off);
@@ -815,8 +976,16 @@ always @(posedge clk) begin
 					cst <= C_IDLE;
 				end
 				else begin
-					r_way <= tag_q[93:92];   // round-robin victim
-					r_beat <= 0;
+					// MC68040UM 4.1: use the first invalid line of the set,
+					// and only otherwise the round-robin victim
+					r_way <= !v_w0 ? 2'd0 : !v_w1 ? 2'd1 : !v_w2 ? 2'd2 :
+					         !v_w3 ? 2'd3 : tag_q[93:92];
+					// MC68040UM 4.6.1: the requested long word is fetched
+					// first and handed to the requester as soon as it
+					// arrives; the remaining beats follow in wrap order
+					r_beat <= r_addr[3:2];
+					fill_cnt <= 0;
+					fill_acked <= 0;
 					r_issued <= 0;
 					cst <= C_FILL;
 				end
@@ -834,32 +1003,54 @@ always @(posedge clk) begin
 					// the still-asserted request from being
 					// re-accepted before the core withdraws it.
 					r_issued <= 0;
-					err_hold <= 1;
+					// once the requester has its data the request is gone;
+					// holding would block the next one forever
+					err_hold <= !fill_acked;
 					cst <= C_FERR;
 				end
-				else if (fill_line_match) begin
+				else if (fill_line_match || (r_issued && m_ack)) begin : fill_beat
 					// The data RAM write runs in parallel (cd_we), just as it
-					// does for a returned bus beat.  Completion remains late:
-					// C_TAGW validates the line and acknowledges the request.
-					if (r_beat == r_addr[3:2]) fill_hold <= fill_line_word;
-					if (r_beat == 2'd3) cst <= C_TAGW;
-					else r_beat <= r_beat + 2'd1;
+					// does for a returned bus beat.  The requester is
+					// acknowledged as soon as its word (or word pair) is in;
+					// C_TAGW then validates the line for everyone else.
+					reg [31:0] w;
+					w = fill_line_match ? fill_line_word : m_rdata;
+					if (fill_cnt == 2'd0) fill_hold <= w;
+					if (fill_cnt == 2'd1) fill_hold2 <= w;
+					if (!fill_acked &&
+					    ((fill_cnt == 2'd0 && !r_span2) || (fill_cnt == 2'd1 && r_span2))) begin
+						rdata_r <= r_span2 ? span_extract({fill_hold, w}, r_size, r_off)
+						                   : lw_extract(w, r_size, r_off);
+						ack_r <= 1;
+						fill_acked <= 1;
+					end
+					r_issued <= 0;
+					if (fill_cnt == 2'd3) cst <= C_TAGW;
+					else begin
+						r_beat <= r_beat + 2'd1;
+						fill_cnt <= fill_cnt + 2'd1;
+					end
 				end
 				else if (!r_issued) r_issued <= 1;
-				else if (m_ack) begin
-					// the data RAM write runs in parallel (cd_we)
-					if (r_beat == r_addr[3:2]) fill_hold <= m_rdata;
-					r_issued <= 0;
-					if (r_beat == 2'd3) cst <= C_TAGW;
-					else r_beat <= r_beat + 2'd1;
-				end
 			end
 
 			C_TAGW: begin
 				// the tag row write runs in parallel (tag_we): new tag,
 				// its valid bit, and the advanced round robin
-				rdata_r <= lw_extract(fill_hold, r_size, r_off);
-				ack_r <= 1;
+				if (!fill_acked) begin
+					rdata_r <= r_span2 ? span_extract({fill_hold, fill_hold2}, r_size, r_off)
+					                   : lw_extract(fill_hold, r_size, r_off);
+					ack_r <= 1;
+				end
+				// a filled instruction line seeds the line buffer (the line
+				// read runs in parallel, iline_tagw_read), so the following
+				// sequential fetches hit it without another lookup
+				if (r_bank) begin
+					iline_pending <= 1;
+					iline_valid <= 0;
+					iline_way <= r_way;
+					iline_tag <= r_addr[31:4];
+				end
 				cst <= C_IDLE;
 			end
 
