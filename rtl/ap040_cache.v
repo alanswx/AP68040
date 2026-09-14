@@ -64,6 +64,10 @@ module ap040_cache
 	// requester was released; hosts that share one bus with the table
 	// walker hold the walker off while this is high.
 	output            c_busy,
+	// The master-side write being presented was already acknowledged to
+	// the requester (posted): the store queue may acknowledge it in the
+	// same cycle it captures it, there is no requester path behind it.
+	output            m_posted,
 
 	// master side (to the bus adapter)
 	output            m_req,
@@ -481,8 +485,13 @@ assign m_wdata = post_active ? p_wdata : c_wdata;
 assign m_fc    = fill_active ? r_fc : (post_active ? p_fc : c_fc);
 
 assign c_ack   = (pass_active && !post_active) ? m_ack : ack_r;
-assign c_line_stb  = iline_stb && iline_valid;
+// The offer is a level, not a pulse: the core refuses a line while a
+// queue fetch is outstanding or a data access acknowledges in the same
+// cycle, and a pulse lost to that refusal cost explicit fetches for the
+// rest of the line (Sieve, 2026-09-14).  The core's accept is idempotent.
+assign c_line_stb  = iline_valid && !iline_pending;
 assign c_busy      = fill_active || (cst == C_TAGW) || post_active;
+assign m_posted    = post_active;
 assign c_line_tag  = iline_tag;
 assign c_line_data = iline_data;
 assign c_rdata = pass_active ? m_rdata : rdata_r;

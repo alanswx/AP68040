@@ -386,6 +386,7 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.c_line_tag(mm_line_tag),
 		.c_line_data(mm_line_data),
 		.c_busy(mm_busy),
+		.m_posted(),
 
 		.m_req(b_req),
 		.m_write(b_write),
