@@ -2008,17 +2008,57 @@ wire [15:0] rd_ir = (state == S_DECODE) ? ir : epf_data[epf_head];
 wire [2:0] rd_mode = rd_ir[5:3];
 wire [1:0] rd_sz = rd_ir[7:6];
 reg rd_valid, rd_quick, rd_flags, rd_wbsup, rd_sextw;
+reg rd_imm;                       // immediate source from the queue (lookahead only)
+reg [1:0] rd_immn;                // ... its word count
+reg [31:0] rd_qimm;               // quick/MOVEQ immediate
 reg [5:0] rd_alu;
 reg [1:0] rd_size, rd_ssize, rd_dsize;
 reg [3:0] rd_sa, rd_da;
 wire [3:0] rd_qval = (rd_ir[11:9] == 3'd0) ? 4'd8 : {1'b0, rd_ir[11:9]};
+// the words behind the queue head, for a lookahead immediate
+wire [15:0] rd_w1 = epf_data[epf_head + 3'd1];
+wire [15:0] rd_w2 = epf_data[epf_head + 3'd2];
+wire [31:0] rd_immv = (rd_immn == 2'd2) ? {rd_w1, rd_w2} : {16'd0, rd_w1};
 always @* begin
 	rd_valid = 0; rd_quick = 0; rd_flags = 1; rd_wbsup = 0; rd_sextw = 0;
+	rd_imm = 0; rd_immn = 2'd1; rd_qimm = {28'd0, rd_qval};
 	rd_alu = `AP040_ALU_MOVE;
 	rd_size = rd_sz; rd_ssize = rd_sz; rd_dsize = rd_sz;
 	rd_sa = {rd_mode[0], rd_ir[2:0]};
 	rd_da = {1'b0, rd_ir[11:9]};
 	case (rd_ir[15:12])
+		4'h0: begin
+			// ORI/ANDI/SUBI/ADDI/EORI/CMPI #imm,Dn at lookahead only: the
+			// immediate is the word (or two) behind the opcode in the
+			// queue and is consumed with it.  In S_DECODE the immediate
+			// sits at the head instead and immf_reg already handles it.
+			if (!rd_ir[8] && rd_mode == 3'b000 && rd_sz != 2'b11 &&
+			    rd_ir[11:9] != 3'b100 && rd_ir[11:9] != 3'b111 &&
+			    (state != S_DECODE) &&
+			    (epf_count >= ((rd_sz == `AP040_SZ_L) ? 4'd3 : 4'd2))) begin
+				rd_valid = 1; rd_imm = 1;
+				rd_immn = (rd_sz == `AP040_SZ_L) ? 2'd2 : 2'd1;
+				rd_da = {1'b0, rd_ir[2:0]};
+				case (rd_ir[11:9])
+					3'b000: rd_alu = `AP040_ALU_OR;
+					3'b001: rd_alu = `AP040_ALU_AND;
+					3'b010: rd_alu = `AP040_ALU_SUB;
+					3'b011: rd_alu = `AP040_ALU_ADD;
+					3'b101: rd_alu = `AP040_ALU_EOR;
+					default: begin rd_alu = `AP040_ALU_CMP; rd_wbsup = 1; end
+				endcase
+			end
+		end
+		4'h7: begin
+			// MOVEQ at lookahead only (S_DECODE keeps its own body)
+			if (!rd_ir[8] && (state != S_DECODE)) begin
+				rd_valid = 1; rd_quick = 1;
+				rd_qimm = {{24{rd_ir[7]}}, rd_ir[7:0]};
+				rd_alu = `AP040_ALU_MOVE; rd_size = `AP040_SZ_L;
+				rd_ssize = `AP040_SZ_L; rd_dsize = `AP040_SZ_L;
+				rd_da = {1'b0, rd_ir[11:9]};
+			end
+		end
 		4'h1, 4'h2, 4'h3: begin
 			rd_size = (rd_ir[15:12] == 4'h1) ? `AP040_SZ_B :
 			          (rd_ir[15:12] == 4'h2) ? `AP040_SZ_L : `AP040_SZ_W;
@@ -2092,8 +2132,14 @@ task dispatch_reg_decode;
 	begin
 		alu_op <= rd_alu;
 		op_size <= rd_size; p_ssize <= rd_ssize; p_dsize <= rd_dsize;
-		p_src <= rd_quick ? SK_IMPL : SK_REG;
-		if (rd_quick) src_val <= {28'd0, rd_qval};
+		p_src <= rd_quick ? SK_IMPL : (rd_imm ? SK_IMM : SK_REG);
+		if (rd_quick) src_val <= rd_qimm;
+		if (rd_imm) begin
+			// consume the immediate word(s) along with the opcode
+			src_val <= rd_immv; imm <= rd_immv; x_ext <= rd_immv;
+			epf_pop = 2'd1 + rd_immn;
+			pc <= pc + 32'd2 + {29'd0, rd_immn, 1'b0};
+		end
 		p_dst <= DK_REG; p_sreg <= rd_sa; p_dreg <= rd_da;
 		p_flags <= rd_flags; p_wbsup <= rd_wbsup; p_sextw <= rd_sextw;
 		rr_a <= rd_sa; rr_b <= rd_da;
@@ -6769,8 +6815,14 @@ always @(posedge clk) begin
 		// resident-PC/context and same-cycle flush checks. The bounded ALU
 		// producer set cannot change the active A7 bank or emit aux writes.
 		// S_DECODE itself never uses lookahead: rd_ir still selects ir there.
+		// A completed store with nothing left to do (S_MWR, r_m_ret ==
+		// S_NEXT) is a producer too: it retires through the same
+		// fetch_next, writes no register at that point, and its
+		// self-modifying-code flush already blocks the pop.
 		if (rd_valid && ((state == S_DECODE) ||
-		    (rd_queue_pop && regs_alu_fire && !aux_we)))
+		    (rd_queue_pop && !aux_we &&
+		     (regs_alu_fire ||
+		      ((state == S_MWR) && d_ack && (r_m_ret == S_NEXT))))))
 			dispatch_reg_decode;
 
 		//-------------------------------------------------- fetch queue engine
