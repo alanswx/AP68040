@@ -902,6 +902,33 @@ function cond_true;
 	end
 endfunction
 
+// cond_true on explicit flags {X,N,Z,V,C} = fl[4:0]: the lookahead branch
+// judges the retiring producer's flags before they reach sr
+function cond_true_fl;
+	input [3:0] cond;
+	input [4:0] fl;
+	begin
+		case (cond)
+			4'h0: cond_true_fl = 1;
+			4'h1: cond_true_fl = 0;
+			4'h2: cond_true_fl = !fl[0] && !fl[2];
+			4'h3: cond_true_fl =  fl[0] ||  fl[2];
+			4'h4: cond_true_fl = !fl[0];
+			4'h5: cond_true_fl =  fl[0];
+			4'h6: cond_true_fl = !fl[2];
+			4'h7: cond_true_fl =  fl[2];
+			4'h8: cond_true_fl = !fl[1];
+			4'h9: cond_true_fl =  fl[1];
+			4'hA: cond_true_fl = !fl[3];
+			4'hB: cond_true_fl =  fl[3];
+			4'hC: cond_true_fl =  fl[3] ==  fl[1];
+			4'hD: cond_true_fl =  fl[3] !=  fl[1];
+			4'hE: cond_true_fl = !fl[2] && (fl[3] == fl[1]);
+			default: cond_true_fl = fl[2] || (fl[3] != fl[1]);
+		endcase
+	end
+endfunction
+
 function [3:0] ffs16;
 	input [15:0] m;
 	integer k;
@@ -2019,6 +2046,15 @@ wire [3:0] rd_qval = (rd_ir[11:9] == 3'd0) ? 4'd8 : {1'b0, rd_ir[11:9]};
 wire [15:0] rd_w1 = epf_data[epf_head + 3'd1];
 wire [15:0] rd_w2 = epf_data[epf_head + 3'd2];
 wire [31:0] rd_immv = (rd_immn == 2'd2) ? {rd_w1, rd_w2} : {16'd0, rd_w1};
+// A short conditional branch at the queue head (Bcc.B, not BSR, not the
+// word/long displacement forms) resolves at the producer's retire on the
+// producer's own flags: the register-only producers write sr[4:0] from
+// alu_fl on this edge, stores leave the flags alone.
+wire        rd_is_bcc = (rd_ir[15:12] == 4'h6) && (rd_ir[11:8] != 4'h1) &&
+                        (rd_ir[7:0] != 8'h00) && (rd_ir[7:0] != 8'hFF);
+wire [31:0] rd_bcc_t  = pc + 32'd2 + sxb(rd_ir[7:0]);
+wire  [4:0] rd_bcc_fl = (regs_alu_fire && p_flags) ? alu_fl : sr[4:0];
+wire        rd_bcc_taken = cond_true_fl(rd_ir[11:8], rd_bcc_fl);
 always @* begin
 	rd_valid = 0; rd_quick = 0; rd_flags = 1; rd_wbsup = 0; rd_sextw = 0;
 	rd_imm = 0; rd_immn = 2'd1; rd_qimm = {28'd0, rd_qval};
@@ -6824,6 +6860,38 @@ always @(posedge clk) begin
 		     (regs_alu_fire ||
 		      ((state == S_MWR) && d_ack && (r_m_ret == S_NEXT))))))
 			dispatch_reg_decode;
+		// The branch lookahead: fetch_next has just dispatched the Bcc at
+		// the head into S_DECODE; resolve it here instead.  Taken: the
+		// same redirect finish_bcc would take a cycle later (refill
+		// dispatch or go_pc), with the trace and interrupt cases left to
+		// the ordinary path.  Not taken: the word behind the branch is
+		// dispatched in its place.  A queue fetch acknowledging in this
+		// cycle is not excluded: the refill seed is written after the
+		// acknowledge's append (brf_seed_data), so it wins, and the
+		// acknowledge would otherwise sit in this decision's path (the
+		// address hint's translation to the acknowledge, -1.26 ns).
+		else if (rd_is_bcc && rd_queue_pop && !aux_we && (state != S_DECODE) &&
+		         !rd_bcc_t[0] &&
+		         !sr[15] && !sr[14] && !irq_pend &&
+		         (regs_alu_fire ||
+		          ((state == S_MWR) && d_ack && (r_m_ret == S_NEXT)))) begin
+			// Taken: only the refill-buffer dispatch (the loop case); a
+			// target outside the buffered sector keeps the ordinary
+			// S_DECODE path (a go_pc expansion here cost 700 ALMs and
+			// routing).  Not taken: the word behind the branch dispatches.
+			if (rd_bcc_taken) begin
+				if (brf_refill_hit(rd_bcc_t) &&
+				    (!epf_armed || epf_next != rd_bcc_t || epf_super != sr_s))
+					decode_dbcc_brf(rd_bcc_t);
+			end
+			else if (epf_count >= 4'd2) begin
+				ir <= epf_data[epf_head + 3'd1];
+				t0_force <= t0_special(epf_data[epf_head + 3'd1]);
+				pc_i <= pc + 32'd2;
+				pc <= pc + 32'd4;
+				epf_pop = 2'd2;
+			end
+		end
 
 		//-------------------------------------------------- fetch queue engine
 		// The queue fills itself: whenever the memory port is idle, the
