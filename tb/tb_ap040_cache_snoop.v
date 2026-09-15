@@ -997,6 +997,82 @@ initial begin
 	end
 	$display("EARLY_ADMISSION_TESTS_COMPLETE");
 
+	//-------------------------------------------------- line-crossing reads
+	// A longword at offset 13-15 or a word at 15 takes word 3 of one line
+	// and word 0 of the next.  Cold first line: bypass.  First line hit,
+	// second missing: the second line is filled and the pair acknowledged
+	// on its first beat.  Both hit: served from the cache in one extra
+	// cycle with no memory read.  Set wrap: the next line carries the
+	// next tag.  A store to the second line is seen by the next read.
+	mem[32'hC00C>>2] = 32'h1122_3344;
+	mem[32'hC010>>2] = 32'h5566_7788;
+	// cold first line: bypassed to memory (this bench's flat model does not
+	// split a misaligned access, so only the completion and the memory
+	// access are checked)
+	line_base = mread_count;
+	cpu_read_count_sized(32'hC00E, 2'b10, d, fill_cycles);
+	if (mread_count == line_base) begin
+		$display("FAIL test 15a: cold crossing read did not reach memory reads=%0d", mread_count-line_base);
+		errors = errors + 1;
+	end
+	cpu_read_count_sized(32'hC00C, 2'b10, d, normal_cycles);   // warm the first line
+	if (d !== 32'h1122_3344) begin
+		$display("FAIL test 15b: warm read data=%h", d);
+		errors = errors + 1;
+	end
+	repeat (24) @(posedge clk);                                 // let the fill land
+	line_base = mread_count;
+	cpu_read_count_sized(32'hC00E, 2'b10, d, fill_cycles);     // first hit, second fills
+	if (d !== 32'h3344_5566 || mread_count == line_base) begin
+		$display("FAIL test 15c: crossing read with second-line fill data=%h reads=%0d", d, mread_count-line_base);
+		errors = errors + 1;
+	end
+	repeat (24) @(posedge clk);                                 // the pair was acknowledged on beat 0; let beats 1-3 land
+	line_base = mread_count;
+	cpu_read_count_sized(32'hC010, 2'b10, d, normal_cycles);   // the second line is now cached
+	if (d !== 32'h5566_7788 || mread_count != line_base || normal_cycles != 3) begin
+		$display("FAIL test 15d: second line not cached after the crossing fill data=%h reads=%0d cycles=%0d", d, mread_count-line_base, normal_cycles);
+		errors = errors + 1;
+	end
+	line_base = mread_count;
+	cpu_read_count_sized(32'hC00D, 2'b10, d, normal_cycles);   // both hit
+	if (d !== 32'h2233_4455 || mread_count != line_base || normal_cycles > 5) begin
+		$display("FAIL test 15e: double-hit crossing long data=%h reads=%0d cycles=%0d", d, mread_count-line_base, normal_cycles);
+		errors = errors + 1;
+	end
+	cpu_read_count_sized(32'hC00F, 2'b01, d, normal_cycles);   // word at 15
+	if (d[15:0] !== 16'h4455 || mread_count != line_base || normal_cycles > 5) begin
+		$display("FAIL test 15f: double-hit crossing word data=%h reads=%0d cycles=%0d", d, mread_count-line_base, normal_cycles);
+		errors = errors + 1;
+	end
+	cpu_read_count_sized(32'hC00F, 2'b10, d, normal_cycles);   // long at 15
+	if (d !== 32'h4455_6677 || mread_count != line_base) begin
+		$display("FAIL test 15g: double-hit crossing long at 15 data=%h reads=%0d", d, mread_count-line_base);
+		errors = errors + 1;
+	end
+	cpu_write(32'hC010, 32'h9999_8888);                          // store into the second line
+	repeat (8) @(posedge clk);
+	line_base = mread_count;
+	cpu_read_count_sized(32'hC00E, 2'b10, d, normal_cycles);
+	if (d !== 32'h3344_9999) begin
+		$display("FAIL test 15h: crossing read after a store to the second line data=%h", d);
+		errors = errors + 1;
+	end
+	// set wrap: line 1FF0 is the last set, its successor 2000 the first set with the next tag
+	mem[32'h1FFC>>2] = 32'hAABB_CCDD;
+	mem[32'h2000>>2] = 32'hEEFF_0011;
+	cpu_read_count_sized(32'h1FFC, 2'b10, d, normal_cycles);
+	repeat (24) @(posedge clk);
+	cpu_read_count_sized(32'h2000, 2'b10, d, normal_cycles);
+	repeat (24) @(posedge clk);
+	line_base = mread_count;
+	cpu_read_count_sized(32'h1FFE, 2'b10, d, normal_cycles);
+	if (d !== 32'hCCDD_EEFF || mread_count != line_base || normal_cycles > 5) begin
+		$display("FAIL test 15i: set-wrap crossing read data=%h reads=%0d cycles=%0d", d, mread_count-line_base, normal_cycles);
+		errors = errors + 1;
+	end
+	$display("CROSSING_READ_TESTS_COMPLETE");
+
 	if (errors == 0) $display("ALL TESTS PASSED");
 	else $display("TEST FAILED with %0d errors", errors);
 	$finish;

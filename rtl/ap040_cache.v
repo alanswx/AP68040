@@ -193,15 +193,26 @@ wire        fits_long = (c_size == `AP040_SZ_B) ||
 // offset 1, 2 or 3, or a word at offset 3, in words 0 to 2) is served from
 // the cache too: on a hit the whole line of the hit way is read one cycle
 // later and the pair assembled; on a miss the fill captures both words.
-// Line-crossing accesses keep the bypass (the two halves may translate
-// and fault differently, and the bus adapter already splits them).
 wire        span2     = !c_instr && (c_addr[3:2] != 2'd3) &&
+                        ((c_size == `AP040_SZ_L && c_addr[1:0] != 2'b00) ||
+                         (c_size == `AP040_SZ_W && c_addr[1:0] == 2'b11));
+// A read that straddles two LINES (word 3 of one and word 0 of the next)
+// is served from the cache when both lines hit: the first lookup takes
+// word 3 of the hit way, a second lookup of the next row (next set, the
+// next tag when the set wraps) takes word 0, and the pair is assembled
+// as for a spanning read.  Either line missing, or any port-B write or
+// snoop around the second lookup, falls back to the bypass.  The core
+// splits page-crossing accesses itself, so both halves of what arrives
+// here translated identically.  (These were 3.8 M reads at 10.5 clocks
+// in the Speedometer bracket, 4 % of its cycles.)
+wire        xline     = !c_instr && (c_addr[3:2] == 2'd3) &&
                         ((c_size == `AP040_SZ_L && c_addr[1:0] != 2'b00) ||
                          (c_size == `AP040_SZ_W && c_addr[1:0] == 2'b11));
 // a word at offset 1 sits inside one longword: extracted, not spanned
 wire        fits_lane = fits_long ||
                         (!c_instr && c_size == `AP040_SZ_W && c_addr[1:0] == 2'b01);
-wire        bypass    = c_nocache || !ena || c_write || !(fits_lane || span2);
+wire        bypass    = c_nocache || !ena || c_write ||
+                        !(fits_lane || span2 || xline);
 
 // Number of bytes following the first byte.  Use a five-bit sum so a
 // transfer ending beyond offset 15 cannot wrap before the comparison.
@@ -251,6 +262,11 @@ reg  [31:0] fill_hold;           // requested longword captured during fill
 reg  [31:0] fill_hold2;          // ... and its successor, for a spanning read
 reg         r_span2;             // the request straddles two longwords
 reg         look2;               // C_LOOK's second cycle: the line read is in
+reg         r_xline;             // the request straddles two lines
+reg         xlook;               // C_LOOK's second lookup (the next line) is in
+reg         xsnooped;            // a snoop touched the next line's row during its read
+reg  [SETW-1:0] r_setB;          // the next line's set ...
+reg  [TAGW-1:0] r_tagB;          // ... and tag
 reg   [1:0] r_hway;              // the way the first C_LOOK cycle found
 reg   [1:0] fill_cnt;            // beats completed in this fill (requested word first)
 reg   [2:0] r_fc;                // the fill's own function code (the requester may be gone)
@@ -298,7 +314,7 @@ wire v_w3 = tag_q[4*TAGW+3];
 // In idle, a qualified physical request may reuse an already-settled RAM
 // read. The same comparator/mux serves this and the ordinary registered
 // lookup; no CPU acknowledgement is combinational in the MMU request.
-wire [TAGW-1:0] compare_tag = (cst == C_IDLE) ? a_tag : r_tag;
+wire [TAGW-1:0] compare_tag = (cst == C_IDLE) ? a_tag : (xlook ? r_tagB : r_tag);
 wire h0 = v_w0 && (t_w0 == compare_tag);
 wire h1 = v_w1 && (t_w1 == compare_tag);
 wire h2 = v_w2 && (t_w2 == compare_tag);
@@ -403,6 +419,7 @@ endfunction
 // the snoop is -- and consumed/cleared in the ce domain.
 wire snoop_fill_row = s_stb && !r_bank && (s_addr[SETW+3:4] == r_row[SETW-1:0]);
 wire snoop_look_row = s_stb && !c_instr && (s_addr[SETW+3:4] == a_set);
+wire snoop_xrow     = s_stb && (s_addr[SETW+3:4] == r_setB);
 reg  fill_snooped, look_snooped;
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -514,7 +531,12 @@ assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
 // been released and c_addr has moved on to its next request or hint: the
 // tag row that C_TAGW rewrites and that the posted store's merge consults
 // must be the transaction's own row, not the live address's.
-assign tag_ridx  = (fill_active || (cst == C_TAGW) || post_active) ? r_row : a_row;
+// the line-crossing read's second lookup reads the next row (data and tag
+// alike) while the first lookup's hit is being decided
+wire xlook_read = (cst == C_LOOK) && r_xline && !xlook && look_hit &&
+                  !look_snooped && !snoop_look_row && !inv_wren;
+assign tag_ridx  = (fill_active || (cst == C_TAGW) || post_active) ? r_row :
+                   xlook_read ? {1'b0, r_setB} : a_row;
 wire [4*TAGW-1:0] tags_next = (r_way == 2'd0) ? {tag_q[4*TAGW-1:TAGW], r_tag} :
                         (r_way == 2'd1) ? {tag_q[4*TAGW-1:2*TAGW], r_tag, tag_q[TAGW-1:0]} :
                         (r_way == 2'd2) ? {tag_q[4*TAGW-1:3*TAGW], r_tag, tag_q[2*TAGW-1:0]} :
@@ -584,7 +606,8 @@ assign inv_idx  = snoop_wr        ? {1'b0, s_addr[SETW+3:4]} :
 
 // The four ways' copies of the requested word arrive together; the tag
 // compare picks one.  Word w of way v sits in array (v + w) mod 4.
-wire  [1:0] q_word = (cst == C_IDLE) ? c_addr[3:2] :
+wire  [1:0] q_word = xlook ? 2'd0 :
+                     (cst == C_IDLE) ? c_addr[3:2] :
                      (cst == C_PASS) ? r_beat : r_addr[3:2];
 wire  [1:0] q_arr  = hit_way + q_word;
 wire [31:0] data_hit = (q_arr == 2'd0) ? data_q0 :
@@ -651,17 +674,20 @@ wire iline_read = iline_seed_read || iline_idle_read || dline_read || iline_tagw
 wire [ROWIW-1:0] line_read_row = iline_idle_read ? {1'b1, c_addr[SETW+3:4]} : r_row;
 wire [1:0] line_read_way = iline_tagw_read ? r_way : hit_way;
 
-assign cd_rd_en  = (cst == C_IDLE) || rd_accept || store_lookup_accept || iline_read;
-// word-wise: array k at way (k - w); line-wise: every array at the hit way
-wire  [1:0] rd_w = c_addr[3:2];
+assign cd_rd_en  = (cst == C_IDLE) || rd_accept || store_lookup_accept || iline_read ||
+                   xlook_read;
+// word-wise: array k at way (k - w); line-wise: every array at the hit way;
+// the crossing read's second lookup: word 0 of the next row
+wire  [1:0] rd_w = xlook_read ? 2'd0 : c_addr[3:2];
+wire  [SETW:0] rd_row = xlook_read ? {1'b0, r_setB} : {c_instr, a_set};
 assign cd_ridx0  = iline_read ? {line_read_row, line_read_way}
-                              : {c_instr, a_set, 2'd0 - rd_w};
+                              : {rd_row, 2'd0 - rd_w};
 assign cd_ridx1  = iline_read ? {line_read_row, line_read_way}
-                              : {c_instr, a_set, 2'd1 - rd_w};
+                              : {rd_row, 2'd1 - rd_w};
 assign cd_ridx2  = iline_read ? {line_read_row, line_read_way}
-                              : {c_instr, a_set, 2'd2 - rd_w};
+                              : {rd_row, 2'd2 - rd_w};
 assign cd_ridx3  = iline_read ? {line_read_row, line_read_way}
-                              : {c_instr, a_set, 2'd3 - rd_w};
+                              : {rd_row, 2'd3 - rd_w};
 // the spanning pair, from the line read of way r_hway: word w in array
 // (way + w) mod 4, its successor in the next array
 wire  [1:0] sp_a0 = r_hway + r_addr[3:2];
@@ -710,6 +736,7 @@ always @(posedge clk) begin
 		r_beat <= 0; r_issued <= 0; r_addr <= 0; r_size <= 0; r_off <= 0;
 		fill_hold <= 0; r_wdata <= 0; pass_store_chk <= 0;
 		fill_hold2 <= 0; r_span2 <= 0; look2 <= 0; r_hway <= 0;
+		r_xline <= 0; xlook <= 0; xsnooped <= 0; r_setB <= 0; r_tagB <= 0;
 		fill_cnt <= 0; fill_acked <= 0; r_fc <= 0; sline_ready <= 0;
 		post_active <= 0; p_addr <= 0; p_wdata <= 0; p_size <= 0; p_fc <= 0;
 		iline_pending <= 0; iline_valid <= 0; iline_way <= 0;
@@ -895,6 +922,10 @@ always @(posedge clk) begin
 						r_span2 <= span2;
 						r_fc <= c_fc;
 						look2 <= 0;
+						r_xline <= xline;
+						xlook <= 0;
+						r_setB <= a_set + {{(SETW-1){1'b0}}, 1'b1};
+						r_tagB <= (&a_set) ? a_tag + {{(TAGW-1){1'b0}}, 1'b1} : a_tag;
 						cst <= C_LOOK;
 					end
 				end
@@ -994,6 +1025,49 @@ always @(posedge clk) begin
 						cst <= C_FILL;
 					end
 				end
+				else if (xlook) begin
+					// the next line's tags and word 0 are in: assemble the
+					// crossing pair on a hit; on a clean miss fill the next
+					// line (word 0 first, the pair acknowledged on that
+					// beat: the line is the one a sequential walk needs
+					// next); a snoop that touched the row around the read
+					// falls back to the bypass
+					xlook <= 0;
+					if (look_hit && !xsnooped && !snoop_xrow) begin
+						rdata_r <= span_extract({fill_hold2, data_hit}, r_size, r_off);
+						ack_r <= 1;
+						cst <= C_IDLE;
+					end
+					else if (!xsnooped && !snoop_xrow) begin
+						r_row  <= {1'b0, r_setB};
+						r_tag  <= r_tagB;
+						r_addr <= {r_addr[31:4] + 28'd1, 4'd0};
+						r_way <= !v_w0 ? 2'd0 : !v_w1 ? 2'd1 : !v_w2 ? 2'd2 :
+						         !v_w3 ? 2'd3 : tag_q[ROWW-1:ROWW-2];
+						r_beat <= 2'd0;
+						fill_cnt <= 0;
+						fill_acked <= 0;
+						r_issued <= 0;
+						cst <= C_FILL;
+					end
+					else begin
+						pass_ci_chk <= 0;
+						cst <= C_PASS;
+					end
+				end
+				else if (r_xline) begin
+					// first line: keep its word 3 and look the next line
+					// up (xlook_read runs the reads); a miss bypasses
+					if (xlook_read) begin
+						fill_hold2 <= data_hit;
+						xsnooped <= snoop_xrow;
+						xlook <= 1;
+					end
+					else begin
+						pass_ci_chk <= 0;
+						cst <= C_PASS;
+					end
+				end
 				else if (look_hit && !look_snooped && !snoop_look_row && r_span2) begin
 					// the line read runs in parallel (dline_read)
 					r_hway <= hit_way;
@@ -1057,7 +1131,8 @@ always @(posedge clk) begin
 					if (fill_cnt == 2'd1) fill_hold2 <= w;
 					if (!fill_acked &&
 					    ((fill_cnt == 2'd0 && !r_span2) || (fill_cnt == 2'd1 && r_span2))) begin
-						rdata_r <= r_span2 ? span_extract({fill_hold, w}, r_size, r_off)
+						rdata_r <= r_span2 ? span_extract({fill_hold, w}, r_size, r_off) :
+						           r_xline ? span_extract({fill_hold2, w}, r_size, r_off)
 						                   : lw_extract(w, r_size, r_off);
 						ack_r <= 1;
 						fill_acked <= 1;
@@ -1076,7 +1151,8 @@ always @(posedge clk) begin
 				// the tag row write runs in parallel (tag_we): new tag,
 				// its valid bit, and the advanced round robin
 				if (!fill_acked) begin
-					rdata_r <= r_span2 ? span_extract({fill_hold, fill_hold2}, r_size, r_off)
+					rdata_r <= r_span2 ? span_extract({fill_hold, fill_hold2}, r_size, r_off) :
+					           r_xline ? span_extract({fill_hold2, fill_hold}, r_size, r_off)
 					                   : lw_extract(fill_hold, r_size, r_off);
 					ack_r <= 1;
 				end
