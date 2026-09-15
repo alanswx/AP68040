@@ -326,7 +326,13 @@ wire        regs_alu_fire = (state == S_PIPE_REGS || state == S_PIPE_SDONE ||
 wire [31:0] alu_src = (regs_alu_fire && state == S_MRD) ? mem_rdata :
                      (regs_alu_fire && state == S_PIPE_SDONE) ? m_val :
                      (regs_alu_fire && p_src == SK_REG) ? rf_capture_a : src_val;
-wire [31:0] alu_dst = regs_alu_fire ? rf_capture_b : dst_val;
+// A register shift with a nonzero count retires in S_PIPE_REGS as well:
+// the ALU composes the whole count in one call (as S_SHIFT does), so the
+// execute, shift and writeback states are skipped.
+wire        shift_fire = (state == S_PIPE_REGS) && (exec_kind == EK_SHIFT) &&
+                         (p_dst == DK_REG);
+wire  [5:0] shift_cnt  = (p_src == SK_REG) ? rf_capture_a[5:0] : src_val[5:0];
+wire [31:0] alu_dst = (regs_alu_fire || shift_fire) ? rf_capture_b : dst_val;
 wire [31:0] alu_a = alu_is_bitop ? (p_dst_mem_bit ? {29'd0, alu_src[2:0]}
                                                   : {27'd0, alu_src[4:0]}) :
                     p_sextw      ? {{16{alu_src[15]}}, alu_src[15:0]} : alu_src;
@@ -338,8 +344,9 @@ ap040_alu alu
 	.op(alu_op), .size(op_size),
 	.a(alu_a), .b(alu_b),
 	.flags_in(alu_fin),
-	.shcnt((state == S_SHIFT) ? sh_cnt : 6'd1),
-	.result(alu_res), .flags_out(alu_fl)
+	.shcnt((state == S_SHIFT) ? sh_cnt : (shift_fire ? shift_cnt : 6'd1)),
+	.result(alu_res), .flags_out(alu_fl),
+	.fast_flags(alu_fast_fl), .fast_ok(alu_fast_ok)
 );
 
 reg         md_start, md_isdiv, md_sign;
@@ -2036,6 +2043,7 @@ wire [2:0] rd_mode = rd_ir[5:3];
 wire [1:0] rd_sz = rd_ir[7:6];
 reg rd_valid, rd_quick, rd_flags, rd_wbsup, rd_sextw;
 reg rd_imm;                       // immediate source from the queue (lookahead only)
+reg rd_shift;                     // register shift (lookahead only)
 reg [1:0] rd_immn;                // ... its word count
 reg [31:0] rd_qimm;               // quick/MOVEQ immediate
 reg [5:0] rd_alu;
@@ -2053,11 +2061,15 @@ wire [31:0] rd_immv = (rd_immn == 2'd2) ? {rd_w1, rd_w2} : {16'd0, rd_w1};
 wire        rd_is_bcc = (rd_ir[15:12] == 4'h6) && (rd_ir[11:8] != 4'h1) &&
                         (rd_ir[7:0] != 8'h00) && (rd_ir[7:0] != 8'hFF);
 wire [31:0] rd_bcc_t  = pc + 32'd2 + sxb(rd_ir[7:0]);
-wire  [4:0] rd_bcc_fl = (regs_alu_fire && p_flags) ? alu_fl : sr[4:0];
+wire  [4:0] alu_fast_fl;
+wire        alu_fast_ok;
+// the producer's flags from the ALU's fast path (compare class) or sr
+wire  [4:0] rd_bcc_fl = (regs_alu_fire && p_flags) ? alu_fast_fl : sr[4:0];
+wire        rd_bcc_fl_ok = !(regs_alu_fire && p_flags) || alu_fast_ok;
 wire        rd_bcc_taken = cond_true_fl(rd_ir[11:8], rd_bcc_fl);
 always @* begin
 	rd_valid = 0; rd_quick = 0; rd_flags = 1; rd_wbsup = 0; rd_sextw = 0;
-	rd_imm = 0; rd_immn = 2'd1; rd_qimm = {28'd0, rd_qval};
+	rd_imm = 0; rd_immn = 2'd1; rd_qimm = {28'd0, rd_qval}; rd_shift = 0;
 	rd_alu = `AP040_ALU_MOVE;
 	rd_size = rd_sz; rd_ssize = rd_sz; rd_dsize = rd_sz;
 	rd_sa = {rd_mode[0], rd_ir[2:0]};
@@ -2083,6 +2095,25 @@ always @* begin
 					3'b101: rd_alu = `AP040_ALU_EOR;
 					default: begin rd_alu = `AP040_ALU_CMP; rd_wbsup = 1; end
 				endcase
+			end
+		end
+		4'hE: begin
+			// register shift/rotate at lookahead only: the count is
+			// immediate (SK_IMPL) or in Dn on port A; S_PIPE_REGS retires it
+			if (rd_sz != 2'b11 && (state != S_DECODE)) begin
+				rd_valid = 1; rd_shift = 1;
+				case (rd_ir[4:3])
+					2'b00: rd_alu = rd_ir[8] ? `AP040_ALU_ASL1 : `AP040_ALU_ASR1;
+					2'b01: rd_alu = rd_ir[8] ? `AP040_ALU_LSL1 : `AP040_ALU_LSR1;
+					2'b10: rd_alu = rd_ir[8] ? `AP040_ALU_ROXL1 : `AP040_ALU_ROXR1;
+					default: rd_alu = rd_ir[8] ? `AP040_ALU_ROL1 : `AP040_ALU_ROR1;
+				endcase
+				rd_da = {1'b0, rd_ir[2:0]};
+				if (rd_ir[5]) rd_sa = {1'b0, rd_ir[11:9]};
+				else begin
+					rd_quick = 1;
+					rd_qimm = {26'd0, (rd_ir[11:9] == 3'd0) ? 6'd8 : {3'd0, rd_ir[11:9]}};
+				end
 			end
 		end
 		4'h7: begin
@@ -2170,6 +2201,8 @@ task dispatch_reg_decode;
 		op_size <= rd_size; p_ssize <= rd_ssize; p_dsize <= rd_dsize;
 		p_src <= rd_quick ? SK_IMPL : (rd_imm ? SK_IMM : SK_REG);
 		if (rd_quick) src_val <= rd_qimm;
+		exec_kind <= rd_shift ? EK_SHIFT : EK_ALU;
+		if (rd_shift) sh_rox <= (rd_ir[4:3] == 2'b10);
 		if (rd_imm) begin
 			// consume the immediate word(s) along with the opcode
 			src_val <= rd_immv; imm <= rd_immv; x_ext <= rd_immv;
@@ -3278,11 +3311,21 @@ always @(posedge clk) begin
 				if (exec_kind == EK_ALU && p_dst == DK_REG) begin
 					retire_operand_alu;
 				end
+				else if (shift_fire && (shift_cnt != 6'd0)) begin
+					// register shift, whole count in one ALU call (a zero
+					// count keeps the S_SHIFT path for its special flags)
+					sr[4:0] <= alu_fl;
+					rfw(p_dreg, merge_sz(rf_capture_b, alu_res, op_size));
+					fetch_next;
+				end
 				else begin
+					// Forwarded ports: a lookahead dispatch lands here one
+					// cycle after its producer's register write, which is
+					// still in flight (rf_we) in this cycle.
 					if (state == S_PIPE_SDONE) src_val <= m_val;
-					else if (p_src == SK_REG) src_val <= rf_rdata_a;
+					else if (p_src == SK_REG) src_val <= rf_capture_a;
 					if (p_dst == DK_REG) begin
-						dst_val <= rf_rdata_b;
+						dst_val <= rf_capture_b;
 						state <= S_EXEC;
 					end
 					else state <= S_PIPE_DST;
@@ -6857,7 +6900,7 @@ always @(posedge clk) begin
 		// self-modifying-code flush already blocks the pop.
 		if (rd_valid && ((state == S_DECODE) ||
 		    (rd_queue_pop && !aux_we &&
-		     (regs_alu_fire ||
+		     (regs_alu_fire || shift_fire ||
 		      ((state == S_MWR) && d_ack && (r_m_ret == S_NEXT))))))
 			dispatch_reg_decode;
 		// The branch lookahead: fetch_next has just dispatched the Bcc at
@@ -6871,7 +6914,7 @@ always @(posedge clk) begin
 		// acknowledge would otherwise sit in this decision's path (the
 		// address hint's translation to the acknowledge, -1.26 ns).
 		else if (rd_is_bcc && rd_queue_pop && !aux_we && (state != S_DECODE) &&
-		         !rd_bcc_t[0] &&
+		         rd_bcc_fl_ok && !rd_bcc_t[0] &&
 		         !sr[15] && !sr[14] && !irq_pend &&
 		         (regs_alu_fire ||
 		          ((state == S_MWR) && d_ack && (r_m_ret == S_NEXT)))) begin
