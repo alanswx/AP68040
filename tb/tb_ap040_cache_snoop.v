@@ -415,8 +415,8 @@ initial begin
 	for (i = 0; i < 16384; i = i + 1) mem[i] = 32'h1111_0000 + i;
 	repeat (4) @(negedge clk);
 	nreset = 1;
-	// let the reset sweep finish
-	repeat (200) @(posedge clk);
+	// let the reset sweep finish (2**ROWIW rows; 512 at the 16 KB geometry)
+	repeat (600) @(posedge clk);
 
 	//------------------------------------------------------------------
 	// T1 (5.1): snoop during a frozen ce window
@@ -534,7 +534,7 @@ initial begin
 			errors = errors + 1;
 			off = 4;   // no point sweeping a wedged cache
 		end
-		repeat (200) @(posedge clk);
+		repeat (600) @(posedge clk);
 
 		err_arm = 1;
 		err_addr = 32'h0000_6000;
