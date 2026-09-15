@@ -3048,6 +3048,13 @@ always @(posedge clk) begin
 						dst_val <= rf_rdata_b;
 						state <= S_EXEC;
 					end
+					// UNLK: A7 was written with the read issue; the
+					// popped frame pointer lands here and the
+					// instruction retires.
+					else if (r_m_ret == S_UNLK3) begin
+						rfw({1'b1, d_rn}, mem_rdata);
+						fetch_next;
+					end
 					else begin
 						m_val <= mem_rdata;
 						state <= r_m_ret;
@@ -3984,6 +3991,14 @@ always @(posedge clk) begin
 				end
 			end
 
+			// The redirect is issued here, one cycle after the push's
+			// acknowledge, so the port is free and the target fetch goes
+			// out at once: a redirect from inside the acknowledge cycle
+			// is deferred to the fill engine, whose fill does not seed the
+			// branch refill sector (v3, Sieve offset 0: +49 K cycles).
+			// The push's undo record retires with the push: go_pc, unlike
+			// fetch_next, does not clear it, and a fetch fault at the
+			// target must not roll A7 back past the push.
 			S_JSR2: begin
 				rfw(4'd15, dbg_a7 - 32'd4);
 				go_pc(br_tgt);
@@ -4001,21 +4016,17 @@ always @(posedge clk) begin
 				fetch_next;
 			end
 
-			S_LINK1: begin
-				rr_a <= {1'b1, d_rn};
-				state <= S_LINK2;
-			end
-
+			// LINK: decode selected An on port A; push it, and write An
+			// with the same edge (undo-recorded so a faulting push
+			// restarts with the old An).  A7 follows once the push has
+			// completed.
 			S_LINK2: begin : link2
 				reg [31:0] spn;
 				spn = dbg_a7 - 32'd4;
 				t_a <= spn;
-				mwr(spn, `AP040_SZ_L, (d_rn == 3'd7) ? spn : rf_rdata_a, S_LINK3);
-			end
-
-			S_LINK3: begin
-				rfw({1'b1, d_rn}, t_a);
-				state <= S_LINK4;
+				mwr(spn, `AP040_SZ_L, (d_rn == 3'd7) ? spn : rf_rdata_a, S_LINK4);
+				rfw({1'b1, d_rn}, spn);
+				u_rec({1'b1, d_rn}, rf_rdata_a);
 			end
 
 			S_LINK4: begin
@@ -4023,16 +4034,17 @@ always @(posedge clk) begin
 				fetch_next;
 			end
 
+			// UNLK: pop through An, write A7 with the read issue
+			// (undo-recorded), retire in the read's acknowledge cycle.
 			S_UNLK1: begin
-				t_a <= rf_rdata_a;
-				mrd(rf_rdata_a, `AP040_SZ_L, S_UNLK2);
+				mrd(rf_rdata_a, `AP040_SZ_L, S_UNLK3);
+				rfw(4'd15, rf_rdata_a + 32'd4);
+				u_rec(4'd15, dbg_a7);
 			end
 
-			S_UNLK2: begin
-				rfw(4'd15, t_a + 32'd4);
-				state <= S_UNLK3;
-			end
-
+			// Reached only through the byte-split (page-crossing) read
+			// path, which returns to r_m_ret as a state; the aligned
+			// case retires in the S_MRD acknowledge.
 			S_UNLK3: begin
 				rfw({1'b1, d_rn}, m_val);
 				fetch_next;
@@ -6122,7 +6134,8 @@ always @(posedge clk) begin
 									if (d_mode == 3'b001) begin
 										// LINK.L An,#bd32
 										br_long <= 1;
-										immf(2'd2, S_LINK1);
+										rr_a <= {1'b1, d_rn};
+										immf(2'd2, S_LINK2);
 									end
 									else begin
 										// NBCD
@@ -6255,7 +6268,7 @@ always @(posedge clk) begin
 								else if (d_op8_6 == 3'b001) begin
 									casez (ir[5:0])
 										6'b00????: exc(`AP040_VEC_TRAP + {4'd0, ir[3:0]}, 4'd0, pc, 32'd0);
-										6'b010???: begin br_long <= 0; immf(2'd1, S_LINK1); end // LINK.W
+										6'b010???: begin br_long <= 0; rr_a <= {1'b1, d_rn}; immf(2'd1, S_LINK2); end // LINK.W
 										6'b011???: begin rr_a <= {1'b1, d_rn}; state <= S_UNLK1; end
 										6'b100???: begin // MOVE An,USP
 											if (!sr_s) go_priv;
@@ -6285,7 +6298,8 @@ always @(posedge clk) begin
 											end
 										end
 										6'b110100: begin ret_kind <= RK_RTD; immf(2'd1, S_RET1); end
-										6'b110101: begin ret_kind <= RK_RTS; state <= S_RET1; end
+										// RTS: the pop issues from decode (S_RET1 skipped)
+										6'b110101: begin ret_kind <= RK_RTS; mrd(dbg_a7_wb, `AP040_SZ_L, S_RET2); end
 										6'b110110: begin // TRAPV
 											if (sr[1]) exc(`AP040_VEC_TRAPCC, 4'd2, pc, pc_i);
 											else fetch_next;
